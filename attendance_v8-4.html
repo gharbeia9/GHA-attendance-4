@@ -1,0 +1,2558 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>نظام الحضور</title>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script type="module">
+import { initializeApp }    from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getDatabase, ref, push, onValue, remove, set, get, update }
+  from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js';
+
+// ════════════════════════════════════
+//  FIREBASE CONFIG
+// ════════════════════════════════════
+const FB = {
+  apiKey:            "AIzaSyBMBppaDZpvvMPzyFYnibuJHGDOfi5UN-E",
+  authDomain:        "meeting-b216d.firebaseapp.com",
+  databaseURL:       "https://meeting-b216d-default-rtdb.firebaseio.com",
+  projectId:         "meeting-b216d",
+  storageBucket:     "meeting-b216d.firebasestorage.app",
+  messagingSenderId: "659329376332",
+  appId:             "1:659329376332:web:678c8bb41f487f11c994e9"
+};
+
+// ════════════════════════════════════
+//  SECURITY
+// ════════════════════════════════════
+async function sha256(s){
+  const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+let H_MGR='',H_ADM='';
+
+// تنظيف أي نص جاي من المستخدم قبل ما يتحط في HTML
+function esc(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+window.esc=esc;
+// توحيد الحروف العربية للبحث (أ إ آ ← ا ، ى ← ي ، ة ← ه ، وشيل التشكيل)
+function normAr(s){
+  return String(s||'').toLowerCase().replace(/[\u064B-\u0652\u0640]/g,'').replace(/[أإآ]/g,'ا').replace(/ى/g,'ي').replace(/ة/g,'ه').trim();
+}
+window.filterAttendance=function(){ if(window.renderTable) window.renderTable(); };
+
+// ════════════════════════════════════
+//  STATE
+// ════════════════════════════════════
+const DEFAULT_DEPTS=[
+  {name:"مديرية التربية والتعليم",phone:"",code:"",keywords:"تربية تعليم مدارس"},
+  {name:"مديرية الصحة",phone:"",code:"",keywords:"صحة مستشفى طب"},
+  {name:"مديرية الزراعة",phone:"",code:"",keywords:"زراعة"},
+  {name:"مديرية البريد",phone:"",code:"",keywords:"بريد"},
+  {name:"مديرية الكهرباء",phone:"",code:"",keywords:"كهرباء"},
+  {name:"مديرية المياه",phone:"",code:"",keywords:"مياه"},
+  {name:"مديرية الاتصالات",phone:"",code:"",keywords:"اتصالات"},
+  {name:"مديرية التضامن",phone:"",code:"",keywords:"تضامن"},
+  {name:"مديرية التموين",phone:"",code:"",keywords:"تموين"}
+];
+
+// إعدادات الحقول الإلزامية
+const DEFAULT_FIELDS = { dept:true, name:true, role:true, code:false, contact:true };
+
+let app,db,fbConnected=false;
+let attendance={}, currentMeetId=null, meetingStart=null;
+let lastCount = 0;
+let DEPARTMENTS=[], FIELDS={...DEFAULT_FIELDS};
+let selectedRole='', currentSub='present';
+let isUnlocked=false, isAdminMode=false;
+let failCount=0, lockedUntil=0;
+let deptHl=-1, filteredDepts=[];
+window.sortMode='time';
+window.filterMode='all';
+let authMode=null, authTarget=null;
+let currentQRLink='';
+// السكريبت العادي (واتساب الأدمن) محتاج يشوف الحضور والجهات و toast
+window.toast=toast;
+Object.defineProperty(window,'attendance',{get:()=>attendance,configurable:true});
+Object.defineProperty(window,'DEPARTMENTS',{get:()=>DEPARTMENTS,configurable:true});
+
+// ════════════════════════════════════
+//  INIT
+// ════════════════════════════════════
+// لما الكيبورد يطلع على الموبايل - نعمل scroll للـ dropdown
+if(window.visualViewport){
+  window.visualViewport.addEventListener('resize', ()=>{
+    const dd=document.getElementById('deptDd');
+    if(dd && dd.classList.contains('open')){
+      setTimeout(()=>{
+        const wrap=document.getElementById('deptWrap');
+        if(wrap) wrap.scrollIntoView({behavior:'smooth', block:'center'});
+      }, 100);
+    }
+  });
+}
+
+window.addEventListener('DOMContentLoaded', async()=>{
+  window.__contactEl=document.getElementById('contactBox');
+  H_MGR='cb889e05f91275a69d2fb0f7ee4af3b92dae9a0e6ecfcf597bda893a49fb2673';
+  H_ADM='5c9a7f508de2f1ec87076e88a888f9af847c69d68565ab6a6983fc8b497fa1f8';
+  document.getElementById('dateDisplay').textContent=
+    new Date().toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  DEPARTMENTS=JSON.parse(localStorage.getItem('depts_v7')||'null')||DEFAULT_DEPTS;
+  FIELDS=JSON.parse(localStorage.getItem('fields_v7')||'null')||DEFAULT_FIELDS;
+  window.FIELDS_REF=FIELDS;
+  renderDeptDd();
+  renderFieldToggles();
+  updateFormFields();
+  window.FIELDS_REF=FIELDS;
+  setTimeout(()=>{ if(window.buildProgressSteps) window.buildProgressSteps(); },500);
+  try{ await initFirebase(FB); await loadWelcomeMsg(); } catch(e){ console.error(e); }
+  setTimeout(startTour, 2000);
+  // تطبيق الوضع الليلي المحفوظ
+  if(localStorage.getItem('darkMode')==='1'){
+    document.body.classList.add('dark-mode');
+    const btn=document.getElementById('darkModeBtn');
+    if(btn) btn.textContent='☀️';
+  }
+  document.addEventListener('click',e=>{
+    if(!document.getElementById('deptWrap')?.contains(e.target)) closeDeptDd();
+  });
+});
+
+// ════════════════════════════════════
+//  FIREBASE
+// ════════════════════════════════════
+async function initFirebase(config){
+  app=initializeApp(config);
+  db=getDatabase(app);
+  onValue(ref(db,'.info/connected'),snap=>{
+    fbConnected=snap.val()===true;
+    window.fbConnected=fbConnected;
+    document.getElementById('syncDot').textContent=fbConnected?'🔥 مباشر':'⚡ بدون إنترنت';
+  });
+  await loadActiveMeeting();
+  // sync departments من Firebase لكل الأجهزة
+  onValue(ref(db,'departments'),snap=>{
+    if(snap.exists()) DEPARTMENTS=Object.values(snap.val());
+    else set(ref(db,'departments'),Object.fromEntries(DEFAULT_DEPTS.map((d,i)=>[i,d])));
+    localStorage.setItem('depts_v7',JSON.stringify(DEPARTMENTS));
+    renderDeptDd(); renderAdminDepts(); renderCodesTable();
+  });
+  // sync fields من Firebase لكل الأجهزة
+  onValue(ref(db,'fields'),snap=>{
+    if(snap.exists()) FIELDS=snap.val();
+    else set(ref(db,'fields'),DEFAULT_FIELDS);
+    localStorage.setItem('fields_v7',JSON.stringify(FIELDS));
+    window.FIELDS_REF=FIELDS;
+    renderFieldToggles(); updateFormFields();
+    if(window.buildProgressSteps) window.buildProgressSteps();
+  });
+  // sync welcome message من Firebase لكل الأجهزة
+  onValue(ref(db,'settings/welcomeMsg'),snap=>{
+    const msg=snap.exists()?snap.val():'';
+    const el=document.getElementById('welcomeMsg');
+    if(el){ el.textContent=msg; el.parentElement.style.display=msg?'block':'none'; }
+    const inp=document.getElementById('welcomeMsgInput');
+    if(inp) inp.value=msg;
+  });
+}
+
+async function loadActiveMeeting(){
+  const params   = new URLSearchParams(window.location.search);
+  const urlMode  = params.get('mode');
+  const urlToken = params.get('m');
+  const urlMid   = params.get('mid');
+
+  // ══ وضع البروجيكتور ══
+  if(urlMode==='projector'){
+    document.querySelector('.header').style.display='none';
+    document.querySelector('.tabs').style.display='none';
+    document.querySelector('.main').style.padding='0';
+    document.querySelector('.main').style.maxWidth='100%';
+    document.querySelectorAll('.page').forEach(p=>p.style.display='none');
+    document.getElementById('page-projector').style.display='block';
+    await initProjectorPage(urlMid);
+    return;
+  }
+
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()){ await createNewMeeting(); }
+  else {
+    const data=snap.val();
+    currentMeetId=data.id; meetingStart=data.start;
+    const token=data.token||'';
+    // رابط المسجلين — لو الاجتماع قفل أو التوكن غلط يعرض "انتهى"
+    if(urlToken!==null){
+      if(data.closed||urlToken!==token){ showClosed(); return; }
+    }
+    // الرابط الرئيسي (بدون params) — ميتأثرش بإغلاق الاجتماع أبداً
+  }
+  listenAttendance();
+  listenRegistrationState();
+  updateStamp();
+  // تحديث شريط اسم الاجتماع
+  const bar=document.getElementById('meetingBar');
+  const barName=document.getElementById('meetingBarName');
+  if(bar && barName && meetingStart){
+    barName.textContent=getMeetingName(meetingStart);
+    bar.style.display='flex';
+  }
+  setInterval(updateStamp,30000);
+}
+
+// ════════════════════════════════════
+//  PROJECTOR PAGE (مدمج في نفس الملف)
+// ════════════════════════════════════
+let projectorAttendance={}, projectorDepts=[], projectorMeetStart=null;
+let projectorView='present'; // present | absent
+
+async function initProjectorPage(mid){
+  // جلب الجهات
+  onValue(ref(db,'departments'),snap=>{
+    if(snap.exists()) projectorDepts=Object.values(snap.val());
+    renderProjector();
+  });
+
+  // تحديد الاجتماع
+  if(mid){
+    // اجتماع محدد
+    onValue(ref(db,`meetings/${mid}/records`),snap=>{
+      projectorAttendance=snap.exists()?snap.val():{};
+      renderProjector();
+    });
+    const snap=await get(ref(db,`meetings/${mid}`));
+    if(snap.exists()) projectorMeetStart=snap.val().start;
+  } else {
+    // الاجتماع النشط
+    const actSnap=await get(ref(db,'active_meeting'));
+    if(actSnap.exists()){
+      const mid2=actSnap.val().id;
+      projectorMeetStart=actSnap.val().start;
+      onValue(ref(db,`meetings/${mid2}/records`),snap=>{
+        projectorAttendance=snap.exists()?snap.val():{};
+        renderProjector();
+      });
+    }
+  }
+  // تحديث الساعة
+  setInterval(()=>{
+    const el=document.getElementById('projClock');
+    if(el) el.textContent=new Date().toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+  },1000);
+}
+
+window.setProjectorView=function(v){
+  projectorView=v;
+  renderProjector();
+};
+
+function renderProjector(){
+  const recs=Object.values(projectorAttendance).sort((a,b)=>a.timestamp-b.timestamp);
+  const deptNames=projectorDepts.map(d=>d.name);
+  const presentD=new Set(recs.map(r=>r.dept));
+  const absentD=deptNames.filter(d=>!presentD.has(d));
+  const pct=deptNames.length?Math.floor(presentD.size*100/deptNames.length):0;
+  const now=new Date().toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+
+  const presRows=recs.map((r,i)=>`
+    <tr style="border-bottom:1px solid #f0f0f2;animation:fadeIn .3s ease">
+      <td style="padding:14px 18px;color:#999;font-size:15px">${i+1}</td>
+      <td style="padding:14px 18px;font-weight:700;font-size:16px">${esc(r.dept)}</td>
+      <td style="padding:14px 18px;font-size:16px">${esc(r.name||'—')}</td>
+      <td style="padding:14px 18px">
+        <span style="padding:5px 14px;border-radius:20px;font-size:13px;font-weight:700;background:${r.role==='president'?'#0a0a0a':'#333'};color:#fff">
+          ${r.role==='president'?'🔵 رئيس':'🟡 نائب'}
+        </span>
+      </td>
+      <td style="padding:14px 18px;color:#999;font-size:14px">${esc(r.time)}</td>
+    </tr>`).join('');
+
+  const absRows=absentD.map((d,i)=>`
+    <tr style="border-bottom:1px solid #f0f0f2">
+      <td style="padding:14px 18px;color:#999;font-size:15px">${i+1}</td>
+      <td style="padding:14px 18px;font-weight:700;font-size:16px;color:#cc2200">${esc(d)}</td>
+      <td style="padding:14px 18px" colspan="3">
+        <span style="padding:5px 14px;border-radius:20px;font-size:13px;font-weight:700;background:#fff0ee;color:#cc2200;border:1px solid rgba(204,34,0,.2)">❌ لم تُسجَّل</span>
+      </td>
+    </tr>`).join('');
+
+  const el=document.getElementById('projContent');
+  if(!el) return;
+  el.innerHTML=`
+    <div style="font-family:'Cairo',sans-serif;background:#fff;min-height:100vh;padding:20px">
+      <style>@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}</style>
+
+      <!-- HEADER -->
+      <div style="background:#0a0a0a;border-radius:16px;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:12px">
+        <div style="font-size:20px;font-weight:900;color:#fff">🏛️ اجتماع المجلس التنفيذي — محافظة الغربية</div>
+        <div id="projClock" style="font-size:28px;font-weight:900;color:#fff">${now}</div>
+      </div>
+
+      <!-- STATS -->
+      <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+        <div style="flex:1;min-width:110px;background:#0a0a0a;border-radius:14px;padding:16px;text-align:center">
+          <div style="font-size:38px;font-weight:900;color:#ff6b6b">${absentD.length}</div>
+          <div style="font-size:11px;color:rgba(255,255,255,.5);margin-top:3px;font-weight:600">جهات غائبة</div>
+        </div>
+        <div style="flex:1;min-width:110px;background:#0a0a0a;border-radius:14px;padding:16px;text-align:center">
+          <div style="font-size:38px;font-weight:900;color:#fff">${pct}%</div>
+          <div style="font-size:11px;color:rgba(255,255,255,.5);margin-top:3px;font-weight:600">نسبة الحضور</div>
+        </div>
+      </div>
+
+      <!-- PROGRESS BAR -->
+      <div style="height:8px;background:#e5e5e7;border-radius:4px;margin-bottom:16px;overflow:hidden">
+        <div style="height:100%;background:#0a0a0a;border-radius:4px;width:${pct}%;transition:width .5s"></div>
+      </div>
+
+      <!-- TOGGLE -->
+      <div style="display:flex;gap:10px;margin-bottom:16px">
+        <button onclick="setProjectorView('present')"
+          style="flex:1;padding:13px;border-radius:12px;border:2px solid ${projectorView==='present'?'#0a0a0a':'#e5e5e7'};background:${projectorView==='present'?'#0a0a0a':'#fff'};color:${projectorView==='present'?'#fff':'#888'};font-family:'Cairo',sans-serif;font-size:15px;font-weight:700;cursor:pointer;transition:all .2s">
+          ✅ الحاضرون (${recs.length})
+        </button>
+        <button onclick="setProjectorView('absent')"
+          style="flex:1;padding:13px;border-radius:12px;border:2px solid ${projectorView==='absent'?'#cc2200':'#e5e5e7'};background:${projectorView==='absent'?'#cc2200':'#fff'};color:${projectorView==='absent'?'#fff':'#888'};font-family:'Cairo',sans-serif;font-size:15px;font-weight:700;cursor:pointer;transition:all .2s">
+          ❌ لم يحضروا (${absentD.length})
+        </button>
+      </div>
+
+      <!-- TABLE -->
+      <div style="background:#fff;border:1px solid #e5e5e7;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)">
+        <div style="background:#0a0a0a;padding:14px 18px">
+          <div style="font-size:15px;font-weight:800;color:#fff">
+            ${projectorView==='present'?`✅ الحاضرون — ${recs.length} فرد`:`❌ الجهات الغائبة — ${absentD.length} جهة`}
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:14px">
+            <thead>
+              <tr style="background:#f5f5f7">
+                ${projectorView==='present'
+                  ?'<th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">#</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الجهة</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الاسم</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الصفة</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الوقت</th>'
+                  :'<th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">#</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الجهة</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الحالة</th><th></th><th></th>'}
+              </tr>
+            </thead>
+            <tbody>${projectorView==='present'?presRows:absRows}</tbody>
+          </table>
+          ${projectorView==='present'&&!recs.length?'<div style="padding:40px;text-align:center;color:#ccc;font-size:16px">لا يوجد حضور مسجل بعد</div>':''}
+          ${projectorView==='absent'&&!absentD.length?'<div style="padding:40px;text-align:center;color:#ccc;font-size:16px">🎉 جميع الجهات حضرت!</div>':''}
+        </div>
+      </div>
+    </div>`;
+}
+
+function showClosed(){
+  document.querySelector('.tabs').style.display='none';
+  document.querySelector('.main').innerHTML=`
+    <div style="text-align:center;padding:80px 20px">
+      <div style="font-size:80px;margin-bottom:20px">🔒</div>
+      <div style="font-size:22px;font-weight:900;color:var(--error);margin-bottom:12px">الاجتماع انتهى</div>
+      <div style="font-size:14px;color:var(--muted);line-height:1.8">هذا الرابط لم يعد صالحاً.<br>تواصل مع مسؤول الاجتماع.</div>
+    </div>`;
+}
+
+function generateToken(){ return Math.random().toString(36).substring(2,10); }
+
+async function createNewMeeting(){
+  meetingStart=new Date().toISOString();
+  const meetRef=push(ref(db,'meetings'));
+  currentMeetId=meetRef.key;
+  const token=generateToken();
+  await set(ref(db,'active_meeting'),{id:currentMeetId,start:meetingStart,name:getMeetingName(meetingStart),token,closed:false,registrationOpen:false});
+  await set(meetRef,{start:meetingStart,name:getMeetingName(meetingStart),token,records:{}});
+  // تحديث شريط الاجتماع فوراً
+  const bar=document.getElementById('meetingBar');
+  const barName=document.getElementById('meetingBarName');
+  if(bar && barName){
+    barName.textContent=getMeetingName(meetingStart);
+    bar.style.display='flex';
+  }
+}
+
+function listenAttendance(){
+  onValue(ref(db,`meetings/${currentMeetId}/records`),snap=>{
+    attendance=snap.exists()?snap.val():{};
+    renderTable(); updateStamp();
+  });
+  // تحديث الشريط فوراً لو meetingStart موجود
+  const bar=document.getElementById('meetingBar');
+  const barName=document.getElementById('meetingBarName');
+  if(bar && barName && meetingStart){
+    barName.textContent=getMeetingName(meetingStart);
+    bar.style.display='flex';
+  }
+}
+
+function getMeetingName(start){
+  const d=new Date(start||meetingStart);
+  return `اجتماع المجلس التنفيذي لمحافظة الغربية يوم ${d.toLocaleDateString('ar-EG',{weekday:'long'})} بتاريخ ${d.toLocaleDateString('ar-EG',{year:'numeric',month:'long',day:'numeric'})}`;
+}
+
+
+// ════════════════════════════════════
+//  REGISTRATION STATE
+// ════════════════════════════════════
+let registrationOpen=false;
+
+function listenRegistrationState(){
+  onValue(ref(db,'active_meeting/registrationOpen'),snap=>{
+    registrationOpen=snap.val()===true;
+    updateRegState();
+  });
+}
+
+function updateRegState(){
+  const waitScreen=document.getElementById('waitScreen');
+  const regForm=document.getElementById('regFormContent');
+  if(!waitScreen||!regForm) return;
+  if(registrationOpen){
+    waitScreen.style.display='none';
+    regForm.style.display='block';
+  } else {
+    waitScreen.style.display='flex';
+    regForm.style.display='none';
+  }
+  const openBtn=document.getElementById('regOpenBtn');
+  if(openBtn){
+    openBtn.textContent=registrationOpen?'🔒 إغلاق التسجيل':'🔓 فتح التسجيل';
+    openBtn.style.background=registrationOpen?'var(--error-light)':'var(--success-light)';
+    openBtn.style.color=registrationOpen?'var(--error)':'var(--success)';
+    openBtn.style.borderColor=registrationOpen?'rgba(204,34,0,.2)':'rgba(0,135,90,.2)';
+  }
+}
+
+window.toggleRegistration=async function(){
+  const newState=!registrationOpen;
+  await set(ref(db,'active_meeting/registrationOpen'),newState);
+  toast(newState?'🔓 تم فتح التسجيل للجميع':'🔒 تم إغلاق التسجيل','success');
+};
+
+// ════════════════════════════════════
+//  STAMP
+// ════════════════════════════════════
+function updateStamp(){
+  if(!meetingStart) return;
+  const s=new Date(meetingStart);
+  document.getElementById('stDate').textContent=s.toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  document.getElementById('stStart').textContent=s.toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+  const recs=Object.values(attendance);
+  if(recs.length){
+    const ts=recs.map(r=>r.timestamp);
+    document.getElementById('stFirst').textContent=new Date(Math.min(...ts)).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+    document.getElementById('stLast').textContent=new Date(Math.max(...ts)).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+  } else { document.getElementById('stFirst').textContent='—'; document.getElementById('stLast').textContent='—'; }
+  const el=Math.floor((Date.now()-s.getTime())/60000);
+  document.getElementById('stElapsed').textContent=`${Math.floor(el/60)}س ${el%60}د`;
+}
+
+// ════════════════════════════════════
+//  FIELD TOGGLES
+// ════════════════════════════════════
+function renderFieldToggles(){
+  const el=document.getElementById('fieldToggles');
+  if(!el) return;
+  const labels={dept:'الجهة',name:'الاسم',role:'الصفة',code:'الكود السري',contact:'📞 تواصل معنا'};
+  el.innerHTML=Object.entries(labels).map(([k,v])=>{
+    const on=k==='contact'?FIELDS.contact!==false:!!FIELDS[k];
+    const txt=k==='contact'?(on?'ظاهرة':'مخفية'):(on?'إلزامي':'اختياري');
+    return `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface2);border-radius:10px;border:1px solid var(--border);margin-bottom:8px">
+      <span style="font-weight:700;font-size:14px">${v}</span>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:12px;color:var(--muted)">${txt}</span>
+        <div onclick="toggleField('${k}')" style="width:44px;height:24px;border-radius:12px;background:${on?'var(--accent)':'var(--border)'};cursor:pointer;transition:all .2s;position:relative">
+          <div style="width:18px;height:18px;border-radius:50%;background:#fff;position:absolute;top:3px;${on?'left:23px':'left:3px'};transition:all .2s"></div>
+        </div>
+      </div>
+    </div>`;}).join('');
+}
+
+window.toggleField=async function(key){
+  // الجهة فقط دايماً إلزامية — الاسم وغيره قابل للتغيير
+  if(key==='dept'){ alert('الجهة إلزامية دائماً ولا يمكن تعطيلها'); return; }
+  FIELDS[key]=(key==='contact')?(FIELDS.contact===false):!FIELDS[key];
+  localStorage.setItem('fields_v7',JSON.stringify(FIELDS));
+  if(db) await set(ref(db,'fields'),FIELDS);
+  renderFieldToggles(); updateFormFields();
+};
+
+function updateFormFields(){
+  // الاسم
+  const nameGroup=document.getElementById('nameGroup');
+  if(nameGroup) nameGroup.style.display=FIELDS.name?'':'none';
+  // الصفة
+  const roleGroup=document.getElementById('roleGroup');
+  const roleLabel=document.getElementById('roleLabel');
+  if(roleGroup){ roleGroup.style.display=FIELDS.role?'':'none'; if(roleLabel) roleLabel.style.display=FIELDS.role?'':'none'; }
+  // الكود
+  const codeGroup=document.getElementById('codeGroup');
+  if(codeGroup) codeGroup.style.display=FIELDS.code?'':'none';
+  // تواصل معنا
+  const cBox=window.__contactEl||document.getElementById('contactBox');
+  if(cBox) cBox.style.display=FIELDS.contact===false?'none':'';
+}
+
+// ════════════════════════════════════
+//  DEPT SEARCH
+// ════════════════════════════════════
+function renderDeptDd(filter=''){
+  filteredDepts=filter?DEPARTMENTS.filter(d=>{
+    const q=filter.trim();
+    if(!q) return true;
+    if(d.name.includes(q)) return true;
+    const kws=(d.keywords||'').split(/\s+/).filter(k=>k);
+    if(kws.some(k=>k.includes(q)||q.includes(k))) return true;
+    return false;
+  }):[...DEPARTMENTS];
+  deptHl=-1;
+  const dd=document.getElementById('deptDd');
+  if(!dd) return;
+  dd.innerHTML=filteredDepts.length===0
+    ?'<div class="dept-option no-res">لا توجد نتائج</div>'
+    :filteredDepts.map((d,i)=>`<div class="dept-option" onclick="selectDept(${esc(JSON.stringify(d.name))},${i})">${esc(d.name)}</div>`).join('');
+}
+window.filterDepts=function(){ document.getElementById('deptVal').value=''; renderDeptDd(document.getElementById('deptSearch').value.trim()); openDeptDd(); };
+function openDeptDd(){
+  renderDeptDd(document.getElementById('deptSearch').value.trim());
+  document.getElementById('deptDd').classList.add('open');
+  // scroll عشان الـ dropdown يبان فوق الكيبورد
+  setTimeout(()=>{
+    const wrap=document.getElementById('deptWrap');
+    if(wrap) wrap.scrollIntoView({behavior:'smooth', block:'center'});
+  }, 300);
+}
+function closeDeptDd(){ document.getElementById('deptDd')?.classList.remove('open'); }
+window.openDeptDd=openDeptDd;
+window.selectDept=function(n){ document.getElementById('deptSearch').value=n; document.getElementById('deptVal').value=n; closeDeptDd(); if(window.updateProgress) window.updateProgress(); };
+window.deptNav=function(e){
+  const opts=document.querySelectorAll('#deptDd .dept-option:not(.no-res)');
+  if(e.key==='ArrowDown') deptHl=Math.min(deptHl+1,opts.length-1);
+  else if(e.key==='ArrowUp') deptHl=Math.max(deptHl-1,0);
+  else if(e.key==='Enter'&&deptHl>=0){ window.selectDept(filteredDepts[deptHl].name,deptHl); e.preventDefault(); return; }
+  else if(e.key==='Escape'){ closeDeptDd(); return; }
+  opts.forEach((o,i)=>o.classList.toggle('hl',i===deptHl));
+};
+
+// ════════════════════════════════════
+//  REGISTER
+// ════════════════════════════════════
+window.registerAttendance=async function(){
+  hideAlerts();
+  if(!isAdminMode && !registrationOpen) return toast('⏳ التسجيل لم يُفتح بعد — انتظر رئيس الاجتماع','warn');
+  const dept=document.getElementById('deptVal').value.trim();
+  if(!dept){
+    const typed=document.getElementById('deptSearch').value.trim();
+    if(typed) return toast('⚠️ من فضلك اختر جهتك من القائمة — لا تكتبها يدوياً','error');
+    return toast('من فضلك اختر الجهة أولاً','error');
+  }
+  const name=document.getElementById('nameInput').value.trim();
+  const note=document.getElementById('noteInput').value.trim();
+  if(!dept) return toast('من فضلك اختر الجهة أولاً','error');
+  if(FIELDS.name && !name) return toast('من فضلك اكتب اسمك الكامل','error');
+  if(FIELDS.role && !selectedRole) return toast('من فضلك اختر صفتك في الاجتماع','error');
+
+  // التحقق من الكود (إلا للأدمن)
+  if(!isAdminMode && FIELDS.code){
+    const entered=(document.getElementById('deptCode')?.value.trim()||'').toUpperCase();
+    const deptObj=DEPARTMENTS.find(d=>d.name===dept);
+    if(deptObj && deptObj.code){
+      if(!entered) return toast('من فضلك أدخل الكود السري للجهة','error');
+      if(entered!==deptObj.code.toUpperCase()) return toast('❌ الكود السري غير صحيح','error');
+    }
+  }
+
+  // منع أي تسجيل تاني من نفس الجهة مهما كانت الصفة
+  const recs=Object.values(attendance);
+  const dupList=recs.filter(a=>a.dept===dept).sort((a,b)=>a.timestamp-b.timestamp);
+  if(dupList.length){
+    if(isAdminMode){
+      const details=dupList.map((a,i)=>`${dupList.length>1?(i+1)+'. ':''}${a.name||'—'} — ${a.roleLabel||a.role||'غير محدد'} — سُجّل الساعة ${a.time||'—'}`).join('\n');
+      const head=dupList.length>1
+        ?`⚠️ الجهة "${dept}" مسجّلة بالفعل (${dupList.length} أشخاص):`
+        :`⚠️ الجهة "${dept}" مسجّلة بالفعل:`;
+      if(!confirm(`${head}\n\n${details}\n\nهل تريد تسجيل "${name||'—'}" أيضاً من نفس الجهة؟`)) return;
+    } else {
+      return toast(`❌ تم تسجيل "${dept}" مسبقاً — لا يمكن التسجيل مرة أخرى`,'error');
+    }
+  }
+
+  // منع تكرار نفس الجهاز (إلا للأدمن)
+  if(!isAdminMode){
+    const reg=localStorage.getItem(`reg_${currentMeetId}`);
+    if(reg){
+      document.getElementById('page-register').innerHTML=`
+        <div class="success-page">
+          <div style="width:96px;height:96px;border-radius:50%;background:linear-gradient(135deg,#f59e0b,#d97706);display:flex;align-items:center;justify-content:center;font-size:44px;margin:0 auto 20px;box-shadow:0 8px 28px rgba(217,119,6,.3);animation:popIn .5s cubic-bezier(.175,.885,.32,1.275)">⚠️</div>
+          <div style="font-size:22px;font-weight:900;color:var(--text);margin-bottom:6px">تم تسجيل حضورك مسبقاً</div>
+          <div style="font-size:14px;color:var(--muted);margin-bottom:20px">لا يمكن التسجيل أكثر من مرة</div>
+          <div class="success-card" style="max-width:380px;margin:0 auto">
+            <div class="success-row">
+              <span class="success-row-label">البيانات المسجّلة</span>
+              <span class="success-row-value">${esc(reg)}</span>
+            </div>
+          </div>
+          <div class="success-locked" style="background:var(--warn-light);border-color:rgba(217,119,6,.2);color:var(--warn)">
+            <span>🔒</span><span>تواصل مع مسؤول الاجتماع لو في مشكلة</span>
+          </div>
+        </div>`;
+      document.querySelector('.tabs').style.display='none';
+      if(window.__contactEl) document.getElementById('page-register').appendChild(window.__contactEl);
+      return;
+    }
+  }
+
+  const now=new Date();
+  const record={
+    dept, name,
+    role: selectedRole||'غير محدد',
+    roleLabel: selectedRole==='president'?'رئيس الجهة':selectedRole==='deputy'?'نائب عن الرئيس':'غير محدد',
+    note,
+    time: now.toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}),
+    date: now.toLocaleDateString('ar-EG'),
+    timestamp: Date.now()
+  };
+
+  if(!db) return toast('⚠️ لم يتم الاتصال بـ Firebase','error');
+  if(!currentMeetId) return toast('⚠️ لا يوجد اجتماع نشط — تواصل مع الأدمن','error');
+
+  try{
+    const fresh=await get(ref(db,`meetings/${currentMeetId}/records`));
+    if(!isAdminMode && fresh.exists() && Object.values(fresh.val()).some(a=>a.dept===dept)){
+      return toast(`❌ تم تسجيل "${dept}" مسبقاً — لا يمكن التسجيل مرة أخرى`,'error');
+    }
+    await push(ref(db,`meetings/${currentMeetId}/records`),record);
+    if(!isAdminMode){
+      localStorage.setItem(`reg_${currentMeetId}`,`${name} — ${dept}`);
+      const now2=new Date();
+      document.getElementById('page-register').innerHTML=`
+        <div class="success-page">
+          <div class="success-circle" style="animation:successPop .6s cubic-bezier(.175,.885,.32,1.275) both">✓</div>
+          <div style="font-size:24px;font-weight:900;color:var(--text);margin-bottom:6px;animation:successFade .5s ease .3s both">تم تسجيل حضورك!</div>
+          <div style="font-size:14px;color:var(--muted);margin-bottom:20px;animation:successFade .5s ease .4s both">مرحباً بك في الاجتماع 🎉</div>
+          <div class="success-card" style="animation:successFade .5s ease .5s both">
+            <div class="success-row">
+              <span class="success-row-label">الاسم</span>
+              <span class="success-row-value">${esc(name)}</span>
+            </div>
+            <div class="success-row">
+              <span class="success-row-label">الجهة</span>
+              <span class="success-row-value">${esc(dept)}</span>
+            </div>
+            ${record.roleLabel!=='غير محدد'?`
+            <div class="success-row">
+              <span class="success-row-label">الصفة</span>
+              <span class="success-row-value">${record.roleLabel}</span>
+            </div>`:''}
+            <div class="success-row">
+              <span class="success-row-label">وقت التسجيل</span>
+              <span class="success-row-value">${now2.toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'})}</span>
+            </div>
+            <div class="success-row">
+              <span class="success-row-label">التاريخ</span>
+              <span class="success-row-value">${now2.toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}</span>
+            </div>
+          </div>
+          <div class="success-locked">
+            <span>🔒</span>
+            <span>تم إغلاق صفحة التسجيل — شكراً لحضورك</span>
+          </div>
+        </div>`;
+      document.querySelector('.tabs').style.display='none';
+      if(window.__contactEl) document.getElementById('page-register').appendChild(window.__contactEl);
+    } else {
+      toast(`✅ تم تسجيل ${name} — ${dept} 🔥`);
+      document.getElementById('deptSearch').value=''; document.getElementById('deptVal').value='';
+      document.getElementById('nameInput').value=''; document.getElementById('noteInput').value='';
+      if(document.getElementById('deptCode')) document.getElementById('deptCode').value='';
+      selectedRole='';
+      document.getElementById('btnPres').className='role-btn';
+      document.getElementById('btnDep').className='role-btn';
+      setTimeout(hideAlerts,5000);
+    }
+  } catch(e){ toast('❌ فشل التسجيل — تأكد من الاتصال'); }
+};
+
+// ════════════════════════════════════
+//  RENDER TABLE
+// ════════════════════════════════════
+window.renderTable=function renderTable(){
+  const recs=Object.entries(attendance);
+  const deptNames=DEPARTMENTS.map(d=>d.name);
+  const presentDepts=new Set(recs.map(([,r])=>r.dept));
+  const absentDepts=deptNames.filter(d=>!presentDepts.has(d));
+  const pct=deptNames.length?Math.floor(presentDepts.size*100/deptNames.length):0;
+
+  document.getElementById('stPersons').textContent=recs.length;
+  const tdEl=document.getElementById('stTotalDepts'); if(tdEl) tdEl.textContent=deptNames.length;
+  document.getElementById('stAbsent').textContent=absentDepts.length;
+  document.getElementById('stPct').textContent=pct+'%';
+  document.getElementById('cntPres').textContent=recs.length;
+  document.getElementById('cntAbs').textContent=absentDepts.length;
+
+  const newCount=Object.keys(attendance).length;
+  if(newCount>lastCount && lastCount>0){
+    try{
+      const ctx=new(window.AudioContext||window.webkitAudioContext)();
+      const o=ctx.createOscillator(); const g=ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.frequency.value=880; g.gain.value=0.3;
+      o.start(); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.4);
+      o.stop(ctx.currentTime+0.4);
+    }catch(e){}
+  }
+  lastCount=newCount;
+  drawChart();
+
+  // ══ جدول الحاضرين ══
+  const tbody=document.getElementById('presentTbody');
+  const emptyP=document.getElementById('emptyPres');
+  const tblCard=tbody?.closest('.tbl-card');
+
+  if(!recs.length){
+    tbody.innerHTML='';
+    emptyP.style.display='block';
+  } else {
+    emptyP.style.display='none';
+    // فلترة
+    let filtered=[...recs];
+    if(filterMode==='president') filtered=filtered.filter(([,r])=>r.role==='president');
+    else if(filterMode==='deputy') filtered=filtered.filter(([,r])=>r.role==='deputy');
+    // بحث بالاسم أو الجهة
+    const q=normAr(document.getElementById('attendanceSearch')?.value||'');
+    if(q) filtered=filtered.filter(([,r])=>normAr(r.name).includes(q)||normAr(r.dept).includes(q));
+    // ترتيب
+    if(window.sortMode==='alpha') filtered.sort((a,b)=>a[1].dept.localeCompare(b[1].dept,'ar'));
+    else filtered.sort((a,b)=>a[1].timestamp-b[1].timestamp);
+    const sorted=filtered;
+    const allKeys=sorted.map(([k])=>k);
+        tbody.innerHTML=sorted.map(([key,r],i)=>`
+      <tr>
+        <td><span class="row-num">${i+1}</span></td>
+        <td style="font-weight:600;font-size:13px">${esc(r.dept||'—')}</td>
+        <td style="font-weight:600">${esc(r.name||'—')}</td>
+        <td><span class="badge ${r.role==='president'?'b-pres':'b-dep'}">${r.role==='president'?'🔵 رئيس':'🟡 نائب'}</span></td>
+        <td style="color:var(--muted);font-size:12px">${esc(r.time||'—')}</td>
+        <td style="min-width:110px;white-space:nowrap">
+          ${isUnlocked?`
+            <div style="display:flex;gap:4px;align-items:center">
+              <button onclick="moveRecord('${key}',${i},-1,[${allKeys.map(k=>"'"+k+"'").join(',')}])"
+                style="background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:2px 7px;font-size:12px;cursor:pointer;${i===0?'opacity:.3;pointer-events:none':''}" title="للأعلى">▲</button>
+              <button onclick="moveRecord('${key}',${i},1,[${allKeys.map(k=>"'"+k+"'").join(',')}])"
+                style="background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:2px 7px;font-size:12px;cursor:pointer;${i===sorted.length-1?'opacity:.3;pointer-events:none':''}" title="للأسفل">▼</button>
+              <button onclick="deleteRecord('${key}')"
+                style="background:var(--error-light);border:1px solid rgba(204,34,0,.2);color:var(--error);border-radius:6px;padding:3px 7px;font-size:11px;cursor:pointer;font-family:'Cairo',sans-serif">✕</button>
+            </div>
+          `:'&nbsp;'}
+        </td>
+      </tr>`).join('');
+    if(!sorted.length) tbody.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">لا توجد نتائج مطابقة</td></tr>';
+  }
+
+  // ══ جدول الغائبين ══
+  const tbodyA=document.getElementById('absentTbody');
+  const emptyA=document.getElementById('emptyAbs');
+
+  if(!absentDepts.length){
+    tbodyA.innerHTML='';
+    emptyA.style.display='block';
+  } else {
+    emptyA.style.display='none';
+    tbodyA.innerHTML=absentDepts.map((d,i)=>`
+      <tr>
+        <td><span class="row-num">${i+1}</span></td>
+        <td style="font-weight:600">${esc(d)}</td>
+        <td><span class="badge b-abs">❌ لم تُسجَّل</span></td>
+      </tr>`).join('');
+  }
+}
+
+// ════════════════════════════════════
+//  GUIDED TOUR
+// ════════════════════════════════════
+const TOUR_STEPS = [
+  { el:'deptWrap',   title:'الخطوة 1 — اختر جهتك',           text:'اضغط هنا وابحث عن اسم الجهة التابع لها', pos:'above' },
+  { el:'nameInput',  title:'الخطوة 2 — اسمك بالكامل',         text:'اكتب اسمك الكامل في هذه الخانة',          pos:'above' },
+  { el:'roleGroup',  title:'الخطوة 3 — صفتك في الاجتماع',    text:'اختر رئيس الجهة أو نائب عن الرئيس',       pos:'above' },
+  { el:'codeGroup',  title:'الخطوة 4 — الكود السري',          text:'أدخل الكود السري الموجود مع جدول الأعمال', pos:'above', skipIfHidden:true },
+  { el:'regBtn',     title:'الخطوة الأخيرة — سجّل حضورك',    text:'اضغط هنا لتأكيد تسجيل حضورك',             pos:'above' },
+];
+let tourStep=0;
+
+function startTour(){
+  if(localStorage.getItem('tour_done')) return;
+  tourStep=0;
+  showTourStep();
+}
+
+function isElementVisible(el){
+  if(!el) return false;
+  if(el.style.display==='none') return false;
+  if(el.offsetParent===null && el.style.position!=='fixed') return false;
+  // فحص الـ parent
+  let parent=el.parentElement;
+  while(parent){
+    if(getComputedStyle(parent).display==='none') return false;
+    parent=parent.parentElement;
+  }
+  return true;
+}
+
+function showTourStep(){
+  removeTourOverlay();
+  // تخطي الخطوات المخفية
+  while(tourStep<TOUR_STEPS.length){
+    const s=TOUR_STEPS[tourStep];
+    const el=document.getElementById(s.el);
+    if(!el || !isElementVisible(el)){ tourStep++; continue; }
+    break;
+  }
+  if(tourStep>=TOUR_STEPS.length){ endTour(); return; }
+
+  const s=TOUR_STEPS[tourStep];
+  const el=document.getElementById(s.el);
+  if(!el){ endTour(); return; }
+
+  el.scrollIntoView({behavior:'smooth',block:'center'});
+
+  setTimeout(()=>{
+    removeTourOverlay();
+    const rect=el.getBoundingClientRect();
+    // لو العنصر مش في الشاشة بعد الـ scroll — اعمل endTour
+    if(rect.top < 0 || rect.bottom > window.innerHeight){ tourStep++; showTourStep(); return; }
+
+    const overlay=document.createElement('div');
+    overlay.id='tourOverlay';
+    overlay.style.cssText='position:fixed;inset:0;z-index:2000;pointer-events:none';
+    document.body.appendChild(overlay);
+
+    const hl=document.createElement('div');
+    hl.id='tourHL';
+    hl.style.cssText=`position:fixed;top:${rect.top-6}px;left:${rect.left-6}px;width:${rect.width+12}px;height:${rect.height+12}px;border:2px solid #0a0a0a;border-radius:12px;box-shadow:0 0 0 4000px rgba(0,0,0,.6);z-index:2001;pointer-events:none`;
+    document.body.appendChild(hl);
+
+    const tip=document.createElement('div');
+    tip.id='tourTip';
+    const tipW=Math.min(300,window.innerWidth-20);
+    const tipLeft=Math.max(10,Math.min(rect.left,window.innerWidth-tipW-10));
+    const spaceAbove=rect.top;
+    const above=spaceAbove>160;
+    const tipTop=above?rect.top-12:rect.bottom+12;
+
+    tip.style.cssText=`position:fixed;z-index:2002;top:${tipTop}px;left:${tipLeft}px;${above?'transform:translateY(-100%)':''};width:${tipW}px;background:#0a0a0a;border:1.5px solid #333;border-radius:16px;padding:16px 18px;box-shadow:0 8px 32px rgba(0,0,0,.3);font-family:'Cairo',sans-serif`;
+
+    const validSteps=TOUR_STEPS.filter(x=>{ const e=document.getElementById(x.el); return e && isElementVisible(e); }).length;
+    const arrow=above
+      ?`<div style="position:absolute;bottom:-10px;right:24px;width:0;height:0;border-left:10px solid transparent;border-right:10px solid transparent;border-top:10px solid #0a0a0a"></div>`
+      :`<div style="position:absolute;top:-10px;right:24px;width:0;height:0;border-left:10px solid transparent;border-right:10px solid transparent;border-bottom:10px solid #0a0a0a"></div>`;
+
+    tip.innerHTML=`${arrow}
+      <div style="font-size:13px;font-weight:900;color:#fff;margin-bottom:5px">${s.title}</div>
+      <div style="font-size:13px;color:rgba(255,255,255,.7);margin-bottom:14px;line-height:1.6">${s.text}</div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <span style="font-size:11px;color:rgba(255,255,255,.4)">${tourStep+1} من ${validSteps}</span>
+        <div style="display:flex;gap:8px">
+          <button onclick="endTour()" style="padding:6px 13px;background:transparent;border:1px solid rgba(255,255,255,.2);border-radius:8px;color:rgba(255,255,255,.5);font-family:'Cairo',sans-serif;font-size:12px;cursor:pointer;pointer-events:all">تخطي</button>
+          <button onclick="nextTourStep()" style="padding:6px 16px;background:#fff;border:none;border-radius:8px;color:#0a0a0a;font-family:'Cairo',sans-serif;font-size:13px;font-weight:700;cursor:pointer;pointer-events:all">${tourStep===validSteps-1?'انتهى ✓':'التالي ←'}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(tip);
+  }, 400);
+}
+
+function removeTourOverlay(){
+  ['tourOverlay','tourHL','tourTip'].forEach(id=>document.getElementById(id)?.remove());
+}
+window.nextTourStep=function(){ tourStep++; showTourStep(); };
+window.endTour=function(){ removeTourOverlay(); localStorage.setItem('tour_done','1'); };
+window.restartTour=function(){ localStorage.removeItem('tour_done'); tourStep=0; showTourStep(); };
+async function loadWelcomeMsg(){
+  const snap=await get(ref(db,'settings/welcomeMsg'));
+  const msg=snap.exists()?snap.val():'';
+  const el=document.getElementById('welcomeMsg');
+  if(el){ el.textContent=msg; el.parentElement.style.display=msg?'block':'none'; }
+  const inp=document.getElementById('welcomeMsgInput');
+  if(inp) inp.value=msg;
+}
+window.saveWelcomeMsg=async function(){
+  const msg=document.getElementById('welcomeMsgInput').value.trim();
+  await set(ref(db,'settings/welcomeMsg'),msg);
+  const el=document.getElementById('welcomeMsg');
+  if(el){ el.textContent=msg; el.parentElement.style.display=msg?'block':'none'; }
+  toast('✅ تم حفظ رسالة الترحيب');
+};
+
+// ════════════════════════════════════
+//  ORG IDENTITY
+// ════════════════════════════════════
+function loadOrgIdentity(){
+  const name='محافظة الغربية';
+  const icon=localStorage.getItem('org_icon')||'📋';
+  document.getElementById('headerLogo').textContent=icon;
+  const inp=document.getElementById('orgNameInput');
+  const ico=document.getElementById('orgIconInput');
+  if(inp) inp.value=name;
+  if(ico) ico.value=icon;
+  updateOrgPreview();
+}
+window.updateOrgPreview=function(){
+  const name=document.getElementById('orgNameInput')?.value||'نظام الحضور';
+  const icon=document.getElementById('orgIconInput')?.value||'📋';
+  const pName=document.getElementById('previewName');
+  const pLogo=document.getElementById('previewLogo');
+  if(pName) pName.textContent=name;
+  if(pLogo) pLogo.textContent=icon;
+};
+window.saveOrgIdentity=function(){
+  const name=document.getElementById('orgNameInput').value.trim()||'نظام الحضور';
+  const icon=document.getElementById('orgIconInput').value.trim()||'📋';
+  localStorage.setItem('org_name',name);
+  localStorage.setItem('org_icon',icon);
+  document.getElementById('headerLogo').textContent=icon;
+  updateOrgPreview();
+  toast('✅ تم حفظ هوية المنظمة');
+};
+
+// ════════════════════════════════════
+//  QR CODE
+// ════════════════════════════════════
+
+window.generateQRCode=async function(){
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()){ toast('لا يوجد اجتماع نشط','warn'); return; }
+  const token=snap.val().token||'';
+  const base=window.location.origin+window.location.pathname;
+  currentQRLink=`${base}?m=${token}`;
+
+  // quickchart.io يدعم CORS كامل على GitHub Pages
+  const qrUrl=`https://quickchart.io/qr?text=${encodeURIComponent(currentQRLink)}&size=200&margin=2`;
+
+  const container=document.getElementById('qrDisplay');
+  const linkEl=document.getElementById('qrLinkDisplay');
+  container.innerHTML='<div style="color:var(--muted);font-size:13px">جاري التوليد...</div>';
+
+  const img=document.createElement('img');
+  img.id='qrImg';
+  img.style.cssText='width:200px;height:200px;border-radius:12px;display:block;margin:auto';
+  img.alt='QR Code';
+  img.onload=()=>{ container.innerHTML=''; container.appendChild(img); toast('✅ تم توليد QR Code'); };
+  img.onerror=()=>{
+    // fallback
+    img.src=`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(currentQRLink)}&margin=10`;
+    img.onerror=()=>{ container.innerHTML='<div style="color:var(--error);font-size:13px">⚠️ فشل التوليد — تأكد من الاتصال</div>'; };
+  };
+  img.src=qrUrl;
+  linkEl.textContent=currentQRLink;
+};
+
+window.downloadQR=function(){
+  if(!currentQRLink){ toast('اضغط "توليد QR" أولاً','warn'); return; }
+  const link=`https://quickchart.io/qr?text=${encodeURIComponent(currentQRLink)}&size=400&margin=2`;
+  const a=document.createElement('a'); a.href=link; a.download='qr-attendance.png'; a.click();
+};
+
+window.printQR=function(){
+  if(!currentQRLink){ toast('اضغط "توليد QR" أولاً','warn'); return; }
+  const orgName='محافظة الغربية';
+  const qrUrl=`https://quickchart.io/qr?text=${encodeURIComponent(currentQRLink)}&size=400&margin=2`;
+  const w=window.open('','_blank');
+  w.document.write(`<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8">
+<style>body{font-family:'Cairo',sans-serif;text-align:center;padding:40px;background:#fff}
+h1{font-size:22px;font-weight:900;margin-bottom:8px}
+.sub{font-size:14px;color:#666;margin-bottom:24px}
+img{width:260px;height:260px;margin:0 auto;display:block}
+.inst{margin-top:20px;font-size:13px;color:#888;border:1px solid #e5e5e7;border-radius:8px;padding:10px 16px;display:inline-block}
+@media print{body{padding:20px}}</style></head>
+<body>
+<h1>${orgName}</h1>
+<div class="sub">${getMeetingName()}</div>
+<img src="${qrUrl}">
+<div class="inst">📱 امسح الكود بكاميرا موبايلك لتسجيل حضورك</div>
+<script>window.onload=()=>window.print()<\/script>
+</body></html>`);
+  w.document.close();
+};
+// ════════════════════════════════════
+//  TOAST NOTIFICATIONS
+// ════════════════════════════════════
+function toast(msg, type='success', duration=4000){
+  // إنشاء container لو مش موجود
+  let container=document.getElementById('toastContainer');
+  if(!container){
+    container=document.createElement('div');
+    container.id='toastContainer';
+    container.style.cssText='position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:min(420px,90vw)';
+    document.body.appendChild(container);
+  }
+
+  const colors={
+    success:{bg:'#0a0a0a',color:'#fff',icon:'✅'},
+    error:  {bg:'#cc2200',color:'#fff',icon:'⚠️'},
+    info:   {bg:'#0066ff',color:'#fff',icon:'ℹ️'},
+    warn:   {bg:'#b45309',color:'#fff',icon:'💡'},
+  };
+  const c=colors[type]||colors.success;
+
+  const el=document.createElement('div');
+  el.style.cssText=`background:${c.bg};color:${c.color};padding:13px 20px;border-radius:14px;font-family:'Cairo',sans-serif;font-size:14px;font-weight:600;display:flex;align-items:center;gap:10px;box-shadow:0 8px 30px rgba(0,0,0,.25);pointer-events:all;animation:toastIn .3s cubic-bezier(.175,.885,.32,1.275);width:100%;cursor:pointer`;
+  el.innerHTML=`<span style="font-size:18px">${c.icon}</span><span style="flex:1">${esc(msg)}</span><span style="opacity:.6;font-size:18px" onclick="this.parentElement.remove()">✕</span>`;
+  el.onclick=()=>el.remove();
+
+  container.appendChild(el);
+
+  // إضافة الـ animation في الـ style لو مش موجودة
+  if(!document.getElementById('toastStyle')){
+    const s=document.createElement('style');
+    s.id='toastStyle';
+    s.textContent=`@keyframes toastIn{from{opacity:0;transform:translateY(-12px) scale(.95)}to{opacity:1;transform:translateY(0) scale(1)}}
+    @keyframes toastOut{from{opacity:1;transform:scale(1)}to{opacity:0;transform:scale(.9)}}`;
+    document.head.appendChild(s);
+  }
+
+  // إخفاء تلقائي
+  setTimeout(()=>{
+    el.style.animation='toastOut .25s ease forwards';
+    setTimeout(()=>el.remove(), 250);
+  }, duration);
+}
+
+function showAlert(aId,mId,msg){
+  // الـ inline alerts في صفحة التسجيل
+  const msgEl=document.getElementById(mId);
+  const alertEl=document.getElementById(aId);
+  if(msgEl) msgEl.textContent=msg;
+  if(alertEl) alertEl.classList.add('show');
+  // toast في أي صفحة تانية
+  const type=aId.includes('success')?'success':'error';
+  toast(msg, type);
+}
+function hideAlerts(){
+  document.getElementById('successAlert')?.classList.remove('show');
+  document.getElementById('errorAlert')?.classList.remove('show');
+}
+window.hideAlerts=hideAlerts;
+
+// ════════════════════════════════════
+//  TABS & NAVIGATION
+// ════════════════════════════════════
+window.switchTab=function(tab){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  const map={register:'tabRegister',attendance:'tabAttendance',whatsapp:'tabWhatsapp',archive:'tabArchive',adminpage:'tabAdminPage'};
+  if(map[tab]) document.getElementById(map[tab])?.classList.add('active');
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.getElementById('page-'+tab)?.classList.add('active');
+  if(tab==='attendance'){ renderTable(); updateStamp(); setTimeout(drawChart,100); }
+  if(tab==='whatsapp')  renderWaPanel();
+  if(tab==='archive')   window.renderArchive();
+  if(tab==='adminpage') { renderAdminDepts(); renderCodesTable(); renderFieldToggles(); }
+};
+
+window.switchSub=function(s){
+  currentSub=s;
+  document.getElementById('subPres').className='sub-tab'+(s==='present'?' act-pres':'');
+  document.getElementById('subAbs').className='sub-tab'+(s==='absent'?' act-abs':'');
+  document.getElementById('panelPres').style.display=s==='present'?'block':'none';
+  document.getElementById('panelAbs').style.display=s==='absent'?'block':'none';
+  // تأكد إن جدول الغائبين متحدث
+  if(s==='absent') renderTable();
+};
+
+window.selectRole=function(r){
+  selectedRole=r;
+  window.ROLE_REF=r;
+  document.getElementById('btnPres').className='role-btn'+(r==='president'?' sel-pres':'');
+  document.getElementById('btnDep').className='role-btn'+(r==='deputy'?' sel-dep':'');
+  if(window.updateProgress) window.updateProgress();
+};
+
+// ════════════════════════════════════
+//  ARCHIVE
+// ════════════════════════════════════
+window.renderArchive=async function(){
+  const container=document.getElementById('archiveList');
+  if(!container) return;
+  container.innerHTML='<div class="empty-state"><div class="empty-icon">⏳</div><div class="empty-text">جاري التحميل...</div></div>';
+  const snap=await get(ref(db,'meetings'));
+  if(!snap.exists()){
+    container.innerHTML='<div class="empty-state"><div class="empty-icon">📁</div><div class="empty-text">لا يوجد اجتماعات بعد</div></div>';
+    return;
+  }
+  const meetings=snap.val();
+  const keys=Object.keys(meetings).reverse();
+  container.innerHTML=keys.map(k=>{
+    const m=meetings[k];
+    const recs=m.records?Object.values(m.records):[];
+    const pD=new Set(recs.map(r=>r.dept)).size;
+    const pct=DEPARTMENTS.length?Math.floor(pD*100/DEPARTMENTS.length):0;
+    const active=k===currentMeetId;
+    return `
+    <div class="archive-item" style="${active?'border-color:var(--dark);border-width:2px':''}">
+      <div class="archive-info">
+        <div class="archive-title">${active?'🟢 الاجتماع الحالي — ':''} ${esc(m.name||'اجتماع')}</div>
+        <div class="archive-meta">${recs.length} فرد | ${pD} جهة حضرت | ${pct}% نسبة حضور</div>
+      </div>
+      <div class="archive-actions">
+        <button class="btn btn-sm btn-dark" onclick="previewMeeting('${k}')">👁️ عرض</button>
+        <button class="btn btn-sm btn-green" onclick="exportMeetingExcel('${k}')">⬇️ Excel</button>
+        ${!active?`<button class="btn btn-sm btn-red" onclick="deleteMeeting('${k}')">🗑️</button>`:''}
+      </div>
+    </div>`;
+  }).join('');
+};
+
+window.previewMeeting=async function(k){
+  const snap=await get(ref(db,`meetings/${k}`));
+  if(!snap.exists()) return;
+  const m=snap.val();
+  const recs=m.records?Object.values(m.records).sort((a,b)=>a.timestamp-b.timestamp):[];
+  document.getElementById('archiveModalTitle').textContent=m.name||'اجتماع';
+  document.getElementById('archiveModalBody').innerHTML=`
+    <div style="margin-bottom:12px;font-size:13px;color:var(--muted)">${recs.length} سجل | ${new Date(m.start).toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}</div>
+    <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="background:var(--surface2)">
+        <th style="padding:9px;text-align:right;border-bottom:1px solid var(--border)">#</th>
+        <th style="padding:9px;text-align:right;border-bottom:1px solid var(--border)">الجهة</th>
+        <th style="padding:9px;text-align:right;border-bottom:1px solid var(--border)">الاسم</th>
+        <th style="padding:9px;text-align:right;border-bottom:1px solid var(--border)">الصفة</th>
+        <th style="padding:9px;text-align:right;border-bottom:1px solid var(--border)">الوقت</th>
+      </tr></thead>
+      <tbody>${recs.map((r,i)=>`
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:9px;color:var(--muted)">${i+1}</td>
+          <td style="padding:9px;font-weight:600">${esc(r.dept)}</td>
+          <td style="padding:9px">${esc(r.name||'—')}</td>
+          <td style="padding:9px"><span class="badge ${r.role==='president'?'b-pres':'b-dep'}">${r.role==='president'?'🔵 رئيس':'🟡 نائب'}</span></td>
+          <td style="padding:9px;color:var(--muted)">${esc(r.time)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table></div>`;
+  document.getElementById('archiveModal').classList.add('open');
+};
+window.closeArchiveModal=function(){ document.getElementById('archiveModal').classList.remove('open'); };
+
+window.deleteMeeting=async function(k){
+  if(!confirm('حذف هذا الاجتماع نهائياً؟')) return;
+  await remove(ref(db,`meetings/${k}`));
+  window.renderArchive();
+  toast('✅ تم حذف الاجتماع','success');
+};
+
+window.exportMeetingExcel=async function(k){
+  const snap=await get(ref(db,`meetings/${k}`));
+  if(!snap.exists()) return;
+  const m=snap.val();
+  const recs=m.records?Object.values(m.records).sort((a,b)=>a.timestamp-b.timestamp):[];
+  makeExcel(m.name||'اجتماع',m.start,recs,DEPARTMENTS.map(d=>d.name));
+  toast('✅ تم تحميل ملف Excel');
+};
+window.showAdminSection=function(id,btn){
+  document.querySelectorAll('.admin-section').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.admin-sidebar-item').forEach(b=>b.classList.remove('active'));
+  const sec=document.getElementById('asec-'+id);
+  if(sec) sec.classList.add('active');
+  if(btn) btn.classList.add('active');
+  if(id==='depts')     renderAdminDepts();
+  if(id==='codes')     renderCodesTable();
+  if(id==='fields')    renderFieldToggles();
+  if(id==='identity')  loadOrgIdentity();
+  if(id==='whatsapp'){ renderWaPanel(); if(window.renderWaAdminPanel) window.renderWaAdminPanel(); }
+  if(id==='firebase'){
+    const el=document.getElementById('fbStatus');
+    if(el){ el.textContent=fbConnected?'✅ متصل بـ Firebase':'⚠️ غير متصل'; el.style.color=fbConnected?'var(--success)':'var(--warn)'; }
+  }
+};
+
+// ════════════════════════════════════
+//  AUTH
+// ════════════════════════════════════
+window.openAuthModal=function(mode,target){
+  if(Date.now()<lockedUntil){ toast(`🔒 انتظر ${Math.ceil((lockedUntil-Date.now())/1000)} ثانية`,'warn'); return; }
+  authMode=mode; authTarget=target||null;
+  const cfg={
+    manager:{icon:'🔑',title:'رئيس الاجتماع',sub:'أدخل رمز رئيس الاجتماع'},
+    admin:{icon:'🔐',title:'وضع الأدمن',sub:'أدخل باسورد الأدمن'},
+    tab:{icon:'🔒',title:'منطقة محمية',sub:'أدخل رمز رئيس الاجتماع'},
+    disableAdmin:{icon:'🔓',title:'إلغاء وضع الأدمن',sub:'أدخل باسورد الأدمن للتأكيد'},
+  };
+  const c=cfg[mode]||cfg.tab;
+  document.getElementById('authIcon').textContent=c.icon;
+  document.getElementById('authTitle').textContent=c.title;
+  document.getElementById('authSub').textContent=c.sub;
+  document.getElementById('authInput').value='';
+  document.getElementById('authError').textContent='';
+  document.getElementById('authAttempts').textContent='';
+  document.getElementById('authSubmit').disabled=false;
+  document.getElementById('authOverlay').classList.add('open');
+  setTimeout(()=>document.getElementById('authInput').focus(),100);
+};
+window.closeAuthModal=function(){
+  const ov=document.getElementById('authOverlay');
+  ov.classList.remove('open');
+  ov.style.display='none';
+  setTimeout(()=>{ ov.style.display=''; },300);
+};
+window.checkAuth=async function(){
+  if(Date.now()<lockedUntil) return;
+  const val=document.getElementById('authInput').value.trim();
+  if(!val) return;
+  const h=await sha256(val);
+  let ok=false;
+  if((authMode==='manager'||authMode==='tab')&&h===H_MGR){
+    window.closeAuthModal();
+    unlockManager();
+    window.switchTab(authTarget||'attendance');
+    ok=true;
+  } else if(authMode==='admin'&&h===H_ADM){
+    window.closeAuthModal();
+    enableAdmin();
+    ok=true;
+  } else if(authMode==='disableAdmin'&&h===H_ADM){
+    window.closeAuthModal();
+    doDisableAdmin();
+    ok=true;
+  }
+  if(!ok){
+    failCount++;
+    document.getElementById('authInput').value='';
+    document.getElementById('authInput').focus();
+    if(failCount>=5){
+      lockedUntil=Date.now()+60000; failCount=0;
+      document.getElementById('authError').textContent='🔒 مقفول لمدة دقيقة';
+      document.getElementById('authSubmit').disabled=true;
+      setTimeout(()=>{ document.getElementById('authSubmit').disabled=false; document.getElementById('authError').textContent=''; },60000);
+    } else {
+      document.getElementById('authError').textContent='❌ رمز غير صحيح';
+      document.getElementById('authAttempts').textContent=`تبقى ${5-failCount} محاولة`;
+    }
+  } else { failCount=0; }
+};
+function unlockManager(){
+  isUnlocked=true;
+  document.getElementById('tabAttendance').style.display='';
+  document.getElementById('tabArchive').style.display='';
+  document.getElementById('tabManagerBtn').style.display='none';
+  renderTable();
+}
+function enableAdmin(){
+  isAdminMode=true; window.isAdminMode=true;
+  document.getElementById('tabAdminToggle').textContent='🔓 إلغاء الأدمن';
+  document.getElementById('tabAdminToggle').style.color='var(--error)';
+  document.getElementById('adminBanner').style.display='flex';
+  document.getElementById('tabAdminPage').style.display='';
+  // الواتساب في الإعدادات مش في الشريط
+  const ab=document.getElementById('adminAttendanceBtns'); if(ab) ab.style.display='flex';
+  if(!isUnlocked) unlockManager();
+  window.switchTab('register');
+}
+function doDisableAdmin(){
+  isAdminMode=false; window.isAdminMode=false;
+  document.getElementById('tabAdminToggle').textContent='🔐 أدمن';
+  document.getElementById('tabAdminToggle').style.color='var(--warn)';
+  document.getElementById('adminBanner').style.display='none';
+  document.getElementById('tabAdminPage').style.display='none';
+  const ab=document.getElementById('adminAttendanceBtns'); if(ab) ab.style.display='none';
+  if(!isUnlocked){
+    document.getElementById('tabAttendance').style.display='none';
+    document.getElementById('tabArchive').style.display='none';
+  }
+  window.switchTab('register');
+  toast('✅ تم إلغاء وضع الأدمن');
+}
+window.disableAdmin=function(){ window.openAuthModal('disableAdmin'); };
+
+// ════════════════════════════════════
+//  MEETING ACTIONS
+// ════════════════════════════════════
+window.closeMeeting=async function(){
+  if(!confirm('إنهاء الاجتماع الحالي وأرشفته؟\nسيتم تصفير التسجيلات وقفل الرابط.')) return;
+  await set(ref(db,'active_meeting/closed'),true);
+  attendance={}; renderTable(); updateStamp();
+  toast('🔒 تم إنهاء الاجتماع وأرشفته — الرابط القديم أُغلق','success',6000);
+};
+window.newMeeting=async function(){
+  if(!confirm('أرشفة الاجتماع الحالي وبدء جديد برابط جديد؟')) return;
+  attendance={}; await createNewMeeting();
+  const snap=await get(ref(db,'active_meeting'));
+  const token=snap.val().token||'';
+  const link=`${window.location.origin+window.location.pathname}?m=${token}`;
+  navigator.clipboard.writeText(link).catch(()=>{});
+  window.switchTab('register');
+  toast('✅ تم بدء اجتماع جديد — تم نسخ الرابط الجديد 🔥');
+};
+window.clearAttendance=async function(){
+  if(!confirm('مسح كل بيانات الحضور؟')) return;
+  await remove(ref(db,`meetings/${currentMeetId}/records`));
+  toast('✅ تم مسح بيانات الحضور');
+};
+
+// ════════════════════════════════════
+//  MOVE RECORD (تحريك في الجدول)
+// ════════════════════════════════════
+window.moveRecord=async function(key, idx, dir, allKeys){
+  // نحسب timestamp جديد عشان نغير الترتيب
+  const recs=Object.entries(attendance);
+  const sorted=[...recs].sort((a,b)=>a[1].timestamp-b[1].timestamp);
+  const realIdx=sorted.findIndex(([k])=>k===key);
+  if(realIdx<0) return;
+  idx=realIdx;
+  const newIdx=idx+dir;
+  if(newIdx<0 || newIdx>=sorted.length) return;
+
+  // نبادل الـ timestamps
+  const thisTs=sorted[idx][1].timestamp;
+  const otherTs=sorted[newIdx][1].timestamp;
+  const thisKey=sorted[idx][0];
+  const otherKey=sorted[newIdx][0];
+
+  try{
+    await update(ref(db,'meetings/'+currentMeetId+'/records'),{
+      [thisKey+'/timestamp']: otherTs-1,
+      [otherKey+'/timestamp']: thisTs+1,
+    });
+  }catch(e){
+    toast('❌ فشل التحريك','error');
+  }
+};
+
+window.deleteRecord=async function(key){
+  if(!confirm('حذف هذا التسجيل؟')) return;
+  await remove(ref(db,`meetings/${currentMeetId}/records/${key}`));
+  toast('✅ تم حذف السجل');
+};
+window.copyMeetingLink=async function(){
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()) return;
+  const token=snap.val().token||'';
+  const link=`${window.location.origin+window.location.pathname}?m=${token}`;
+  navigator.clipboard.writeText(link).then(()=>toast('🔗 تم نسخ رابط التسجيل','info')).catch(()=>prompt('رابط التسجيل:',link));
+};
+window.getProjectorLink=async function(){
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()) return;
+  const mid=snap.val().id;
+  const link=`${window.location.origin+window.location.pathname}?mode=projector&mid=${mid}`;
+  navigator.clipboard.writeText(link).then(()=>toast('📺 تم نسخ رابط البروجيكتور','info')).catch(()=>prompt('رابط البروجيكتور:',link));
+};
+
+// ════════════════════════════════════
+//  EXCEL
+// ════════════════════════════════════
+function makeExcel(meetingName,mStart,recs,deptNames){
+  const wb=XLSX.utils.book_new();
+  const presentD=new Set(recs.map(r=>r.dept));
+  const absentDepts=deptNames.filter(d=>!presentD.has(d));
+  const dateStr=new Date(mStart).toLocaleDateString('ar-EG');
+  const timeStr=new Date(mStart).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+  function applyStyles(ws){
+    if(!ws['!ref']) return;
+    const r=XLSX.utils.decode_range(ws['!ref']);
+    for(let R=r.s.r;R<=r.e.r;R++){
+      for(let C=r.s.c;C<=r.e.c;C++){
+        const a=XLSX.utils.encode_cell({r:R,c:C});
+        if(!ws[a]) continue;
+        ws[a].s=R<=1?{font:{bold:true,sz:R===0?14:12},alignment:{horizontal:'center',readingOrder:2}}:
+                 R===3?{font:{bold:true},alignment:{horizontal:'right',readingOrder:2}}:
+                 C===0?{alignment:{horizontal:'center'}}:{alignment:{horizontal:'right',readingOrder:2}};
+      }
+    }
+    ws['!rightToLeft']=true;
+  }
+  const ws1=XLSX.utils.aoa_to_sheet([[meetingName],[`تاريخ: ${dateStr} | وقت البدء: ${timeStr}`],[],['#','الجهة','الاسم','الصفة','التاريخ','الوقت','ملاحظة'],...recs.map((r,i)=>[i+1,r.dept,r.name||'—',r.roleLabel||r.role,r.date,r.time,r.note||''])]);
+  ws1['!cols']=[{wch:5},{wch:30},{wch:24},{wch:20},{wch:14},{wch:12},{wch:22}];
+  ws1['!merges']=[{s:{r:0,c:0},e:{r:0,c:6}},{s:{r:1,c:0},e:{r:1,c:6}}];
+  applyStyles(ws1); XLSX.utils.book_append_sheet(wb,ws1,'الحاضرون');
+  const ws2=XLSX.utils.aoa_to_sheet([['الجهات الغائبة'],[`تاريخ: ${dateStr}`],[],['#','الجهة','الحالة'],...absentDepts.map((d,i)=>[i+1,d,'لم تحضر'])]);
+  ws2['!cols']=[{wch:5},{wch:30},{wch:16}]; ws2['!merges']=[{s:{r:0,c:0},e:{r:0,c:2}},{s:{r:1,c:0},e:{r:1,c:2}}];
+  applyStyles(ws2); XLSX.utils.book_append_sheet(wb,ws2,'الغائبون');
+  const ws3=XLSX.utils.aoa_to_sheet([['ملخص الاجتماع'],[],['تاريخ',dateStr],['وقت البدء',timeStr],['إجمالي الجهات',deptNames.length],['أفراد حضروا',recs.length],['جهات حضرت',[...presentD].length],['جهات غائبة',absentDepts.length],['نسبة الحضور',Math.floor([...presentD].length*100/deptNames.length)+'%']]);
+  ws3['!cols']=[{wch:24},{wch:20}]; ws3['!merges']=[{s:{r:0,c:0},e:{r:0,c:1}}];
+  applyStyles(ws3); XLSX.utils.book_append_sheet(wb,ws3,'الملخص');
+  XLSX.writeFile(wb,`${meetingName}.xlsx`);
+}
+window.exportExcel=function(){
+  const recs=Object.values(attendance).sort((a,b)=>a.timestamp-b.timestamp);
+  if(!recs.length) return toast('لا يوجد بيانات للتصدير','warn');
+  makeExcel(getMeetingName(),meetingStart,recs,DEPARTMENTS.map(d=>d.name));
+  toast('✅ تم تحميل ملف Excel');
+};
+
+// ════════════════════════════════════
+//  PRINT
+// ════════════════════════════════════
+window.printAttendance=function(){
+  const recs=Object.values(attendance).sort((a,b)=>a.timestamp-b.timestamp);
+  const deptNames=DEPARTMENTS.map(d=>d.name);
+  const presentD=new Set(recs.map(r=>r.dept));
+  const absentD=deptNames.filter(d=>!presentD.has(d));
+  const pct=deptNames.length?Math.floor(presentD.size*100/deptNames.length):0;
+  const dateStr=new Date(meetingStart).toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  const timeStr=new Date(meetingStart).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+  const orgName='محافظة الغربية';
+  const html=`<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8">
+<style>@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Cairo',sans-serif;padding:20px;background:#fff;color:#111;font-size:13px}
+.hdr{text-align:center;margin-bottom:18px;border-bottom:2px solid #111;padding-bottom:12px}
+h1{font-size:18px;font-weight:900;margin-bottom:4px}.sub{font-size:12px;color:#555}
+.stats{display:flex;gap:16px;justify-content:center;margin:12px 0;flex-wrap:wrap}
+.stat{text-align:center;background:#f5f5f5;border-radius:8px;padding:8px 16px}
+.sn{font-size:20px;font-weight:900;color:#111}.sl{font-size:10px;color:#666}
+table{width:100%;border-collapse:collapse;margin-bottom:16px}
+thead th{background:#111;color:#fff;padding:8px 12px;text-align:right;font-size:11px}
+tbody tr:nth-child(even){background:#f8f8f8}td{padding:8px 12px;border-bottom:1px solid #eee;font-size:12px}
+.sec{font-size:13px;font-weight:800;margin:14px 0 6px;color:#111;border-right:3px solid #111;padding-right:7px}
+.footer{text-align:center;font-size:10px;color:#aaa;margin-top:16px;border-top:1px solid #eee;padding-top:8px}
+@media print{body{padding:8px}}</style></head><body>
+<div class="hdr"><h1>${orgName}</h1><div class="sub">كشف الحضور | ${dateStr} | بدأ الاجتماع: ${timeStr}</div></div>
+<div class="stats">
+  <div class="stat"><div class="sn">${recs.length}</div><div class="sl">إجمالي الأفراد</div></div>
+  <div class="stat"><div class="sn">${[...presentD].length}</div><div class="sl">جهات حضرت</div></div>
+  <div class="stat"><div class="sn">${absentD.length}</div><div class="sl">جهات غائبة</div></div>
+  <div class="stat"><div class="sn">${pct}%</div><div class="sl">نسبة الحضور</div></div>
+</div>
+<div class="sec">✅ الحاضرون</div>
+<table><thead><tr><th>#</th><th>الجهة</th><th>الاسم</th><th>الصفة</th><th>الوقت</th><th>التوقيع</th></tr></thead>
+<tbody>${recs.map((r,i)=>`<tr><td>${i+1}</td><td>${esc(r.dept)}</td><td>${esc(r.name||'—')}</td><td>${esc(r.roleLabel||r.role)}</td><td>${esc(r.time)}</td><td style="width:80px;border-bottom:1px solid #ccc"></td></tr>`).join('')}</tbody></table>
+${absentD.length?`<div class="sec">❌ الجهات الغائبة</div>
+<table><thead><tr><th>#</th><th>الجهة</th><th>السبب</th><th>ملاحظة</th></tr></thead>
+<tbody>${absentD.map((d,i)=>`<tr><td>${i+1}</td><td>${esc(d)}</td><td></td><td></td></tr>`).join('')}</tbody></table>`:''}
+<div class="footer">طُبع بتاريخ ${new Date().toLocaleDateString('ar-EG')} — ${orgName}</div>
+<script>window.onload=()=>window.print()<\/script></body></html>`;
+  const w=window.open('','_blank'); w.document.write(html); w.document.close();
+};
+
+// ════════════════════════════════════
+//  WHATSAPP
+// ════════════════════════════════════
+function renderWaPanel(){
+  const presentD=new Set(Object.values(attendance).map(r=>r.dept));
+  const absent=DEPARTMENTS.filter(d=>!presentD.has(d.name));
+  const container=document.getElementById('waAbsentList');
+  if(!container) return;
+  if(!absent.length){
+    container.innerHTML='<div class="empty-state" style="padding:30px"><div class="empty-icon">🎉</div><div class="empty-text">كل الجهات حضرت!</div></div>';
+    return;
+  }
+  container.innerHTML=`
+    <div style="margin-bottom:14px">
+      <button class="btn btn-whatsapp" onclick="sendWaAll()" style="width:100%;justify-content:center;padding:13px;font-size:15px">
+        📲 إرسال للكل دفعة واحدة (${absent.length} جهة)
+      </button>
+    </div>
+    ${absent.map((d,i)=>`
+    <div class="wa-item">
+      <div class="wa-dept-name">❌ ${esc(d.name)}</div>
+      <input type="tel" class="wa-phone" id="waP_${i}" value="${esc(d.phone||'')}" placeholder="01xxxxxxxxx" dir="ltr"
+        onchange="saveWaPhone_(${esc(JSON.stringify(d.name))},this.value)">
+      <button class="btn btn-sm btn-whatsapp" onclick="sendWaSingle(${i},${esc(JSON.stringify(d.name))})">📲</button>
+    </div>`).join('')}`;
+}
+
+window.sendWaSingle=function(i,deptName){
+  const msg=document.getElementById('waMessage')?.value.trim();
+  if(!msg) return toast('من فضلك اكتب الرسالة أولاً','warn');
+  const inp=document.getElementById(`waP_${i}`);
+  if(!inp) return;
+  const phone=inp.value.trim().replace(/\D/g,'');
+  if(!phone) return toast('من فضلك أضف رقم الهاتف','warn');
+  const text=msg.replace(/\{جهة\}/g,deptName);
+  const intl=phone.startsWith('0')?'2'+phone.slice(1):phone;
+  window.open(`https://wa.me/${intl}?text=${encodeURIComponent(text)}`,'_blank');
+};
+window.saveWaPhone_=async function(deptName,val){
+  const idx=DEPARTMENTS.findIndex(d=>d.name===deptName);
+  if(idx>=0){ DEPARTMENTS[idx].phone=val.trim(); await saveDepts(); }
+};
+window.sendWa_=function(i,deptName){
+  const msg=document.getElementById('waMessage')?.value.trim();
+  if(!msg) return toast('من فضلك اكتب الرسالة أولاً','warn');
+  const phone=document.getElementById(`waP_${i}`)?.value.trim().replace(/\D/g,'');
+  if(!phone) return toast('من فضلك أضف رقم الهاتف','warn');
+  const text=msg.replace(/\{جهة\}/g,deptName);
+  const intl=phone.startsWith('0')?'2'+phone.slice(1):phone;
+  window.open(`https://wa.me/${intl}?text=${encodeURIComponent(text)}`,'_blank');
+};
+window.sendWaAll=function(){
+  const msg=document.getElementById('waMessage')?.value.trim();
+  if(!msg) return toast('من فضلك اكتب الرسالة أولاً','warn');
+  const presentD=new Set(Object.values(attendance).map(r=>r.dept));
+  const absent=DEPARTMENTS.filter(d=>!presentD.has(d.name));
+  const withPhone=absent.filter(d=>d.phone&&d.phone.trim());
+  if(!withPhone.length) return toast('لا يوجد أرقام هاتف — أضفها في الإعدادات ← إدارة الجهات','warn');
+  const noPhone=absent.filter(d=>!d.phone||!d.phone.trim());
+  if(noPhone.length && !confirm(`الجهات دي مفيهاش رقم:\n${noPhone.map(d=>d.name).join('\n')}\n\nهيتم الإرسال للباقين فقط. متابعة؟`)) return;
+  toast(`📲 سيتم فتح ${withPhone.length} محادثة واتساب تباعاً`,'info',5000);
+  let i=0;
+  function openNext(){
+    if(i>=withPhone.length){ toast(`✅ تم فتح ${withPhone.length} محادثة واتساب`,'success'); return; }
+    const d=withPhone[i];
+    const text=msg.replace(/\{جهة\}/g,d.name);
+    const phone=d.phone.replace(/\D/g,'');
+    const intl=phone.startsWith('0')?'2'+phone.slice(1):phone;
+    const a=document.createElement('a');
+    a.href=`https://wa.me/${intl}?text=${encodeURIComponent(text)}`;
+    a.target='_blank'; a.rel='noopener noreferrer';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    i++;
+    if(i<withPhone.length) setTimeout(openNext,3000);
+    else toast(`✅ تم فتح ${withPhone.length} محادثة واتساب`,'success');
+  }
+  openNext();
+};
+
+// ════════════════════════════════════
+//  ADMIN DEPTS
+// ════════════════════════════════════
+function renderAdminDepts(){
+  const el=document.getElementById('adminDeptList');
+  if(!el) return;
+  el.innerHTML=DEPARTMENTS.map((d,i)=>`
+    <div style="background:var(--surface2);border-radius:10px;border:1px solid var(--border);margin-bottom:8px;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:8px;padding:9px 13px;flex-wrap:wrap">
+        <span style="font-weight:700;font-size:14px;flex:2">🏢 ${esc(d.name)}</span>
+        <input type="tel" value="${esc(d.phone||'')}" placeholder="رقم الهاتف" dir="ltr"
+          style="padding:6px 10px;background:var(--bg);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-family:'Cairo',sans-serif;font-size:12px;outline:none;width:130px"
+          onchange="window.updatePhone(${i},this.value)">
+        <button class="btn btn-sm btn-red" onclick="removeDept(${i})">حذف</button>
+      </div>
+      <div style="padding:6px 13px 9px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px">
+        <span style="font-size:11px;color:var(--muted);font-weight:700;white-space:nowrap">🔍 كلمات مفتاحية:</span>
+        <input type="text" value="${esc(d.keywords||'')}" placeholder="مثال: تربية مدارس تعليم ..." dir="rtl"
+          style="flex:1;padding:5px 10px;background:var(--bg);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-family:'Cairo',sans-serif;font-size:12px;outline:none"
+          onchange="window.updateKeywords(${i},this.value)">
+      </div>
+    </div>`).join('');
+}
+window.updatePhone=async function(i,v){ DEPARTMENTS[i].phone=v.trim(); await saveDepts(); };
+window.updateKeywords=async function(i,v){ DEPARTMENTS[i].keywords=v.trim(); await saveDepts(); };
+window.addDept=async function(){
+  const name=document.getElementById('newDeptName')?.value.trim();
+  const phone=document.getElementById('newDeptPhone')?.value.trim();
+  if(!name) return;
+  if(DEPARTMENTS.find(d=>d.name===name)){ toast('الجهة موجودة بالفعل!','warn'); return; }
+  DEPARTMENTS.push({name,phone:phone||'',code:''});
+  await saveDepts();
+  document.getElementById('newDeptName').value='';
+  if(document.getElementById('newDeptPhone')) document.getElementById('newDeptPhone').value='';
+  toast(`✅ تم إضافة "${name}"`);
+};
+window.removeDept=async function(i){
+  if(!confirm(`حذف "${DEPARTMENTS[i].name}"؟`)) return;
+  DEPARTMENTS.splice(i,1); await saveDepts();
+  toast('✅ تم حذف الجهة');
+};
+window.importDeptsFromText=async function(){
+  const text=document.getElementById('bulkDeptInput')?.value.trim();
+  if(!text) return;
+  const lines=text.split('\n').map(l=>l.trim()).filter(l=>l);
+  let added=0;
+  for(const name of lines){ if(!DEPARTMENTS.find(d=>d.name===name)){ DEPARTMENTS.push({name,phone:'',code:'',keywords:''}); added++; } }
+  await saveDepts();
+  if(document.getElementById('bulkDeptInput')) document.getElementById('bulkDeptInput').value='';
+  toast(`✅ تم إضافة ${added} جهة`);
+};
+async function saveDepts(){
+  localStorage.setItem('depts_v7',JSON.stringify(DEPARTMENTS));
+  if(db) await set(ref(db,'departments'),Object.fromEntries(DEPARTMENTS.map((d,i)=>[i,d])));
+  renderDeptDd(); renderAdminDepts(); renderCodesTable();
+}
+
+// ════════════════════════════════════
+//  CODES
+// ════════════════════════════════════
+function genCode(){ const L='ABCDEFGHJKLMNPQRSTUVWXYZ'; return `${L[Math.floor(Math.random()*L.length)]}${Math.floor(Math.random()*10)}${Math.floor(Math.random()*10)}`; }
+window.generateAllCodes=async function(){
+  if(!confirm('توليد أكواد عشوائية جديدة لكل الجهات؟')) return;
+  const used=new Set();
+  DEPARTMENTS=DEPARTMENTS.map(d=>{ let c; do{c=genCode();}while(used.has(c)); used.add(c); return{...d,code:c}; });
+  await saveDepts();
+  toast('✅ تم توليد أكواد جديدة');
+};
+function renderCodesTable(){
+  const el=document.getElementById('codesTable');
+  if(!el) return;
+  if(!DEPARTMENTS.some(d=>d.code)){ el.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted);font-size:13px">لا يوجد أكواد — اضغط "توليد للكل" أو أدخلها يدوياً</div>'; return; }
+  el.innerHTML=DEPARTMENTS.map((d,i)=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface2);border-radius:10px;border:1px solid var(--border);margin-bottom:8px">
+      <span style="font-weight:700;font-size:13px;flex:2">🏢 ${esc(d.name)}</span>
+      <input type="text" value="${esc(d.code||'')}" maxlength="4" placeholder="كود" dir="ltr"
+        style="padding:8px 12px;background:var(--bg);border:1.5px solid var(--border);border-radius:8px;color:var(--dark);font-family:'Cairo',sans-serif;font-size:18px;font-weight:900;letter-spacing:4px;outline:none;width:85px;text-align:center;text-transform:uppercase"
+        onchange="window.updateCode(${i},this.value)">
+    </div>`).join('');
+}
+window.updateCode=async function(i,v){ DEPARTMENTS[i].code=v.trim().toUpperCase(); await saveDepts(); };
+window.exportCodesPDF=function(){
+  if(!DEPARTMENTS.some(d=>d.code)){ toast('ولّد الأكواد أولاً','warn'); return; }
+  const orgName='محافظة الغربية';
+  const rows=DEPARTMENTS.map((d,i)=>`<tr><td>${i+1}</td><td>${esc(d.name)}</td><td style="font-size:22px;font-weight:900;letter-spacing:6px;color:#0a3d62">${esc(d.code||'—')}</td></tr>`).join('');
+  const html=`<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8">
+<style>@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Cairo',sans-serif;padding:30px;background:#fff;color:#111}
+h1{text-align:center;font-size:20px;font-weight:900;margin-bottom:6px}.sub{text-align:center;font-size:13px;color:#666;margin-bottom:24px}
+table{width:100%;border-collapse:collapse;font-size:15px}thead th{background:#0a3d62;color:#fff;padding:12px 16px;text-align:right;font-weight:700}
+tbody tr:nth-child(even){background:#f0f7ff}td{padding:12px 16px;border-bottom:1px solid #dce8f5}
+.footer{text-align:center;margin-top:20px;font-size:11px;color:#aaa}@media print{body{padding:10px}}</style></head>
+<body><h1>${orgName} — أكواد الجهات</h1>
+<div class="sub">سري — للتوزيع على ممثلي الجهات فقط | ${new Date().toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}</div>
+<table><thead><tr><th>#</th><th>الجهة</th><th>الكود السري</th></tr></thead><tbody>${rows}</tbody></table>
+<div class="footer">هذه الوثيقة سرية — يُمنع تداولها خارج الجهة المعنية</div>
+<script>window.onload=()=>window.print()<\/script></body></html>`;
+  const w=window.open('','_blank'); w.document.write(html); w.document.close();
+};
+
+// ════════════════════════════════════
+//  DONUT CHART
+// ════════════════════════════════════
+function drawChart(){
+  const canvas=document.getElementById('attendanceChart');
+  if(!canvas) return;
+  const deptNames=DEPARTMENTS.map(d=>d.name);
+  const presentD=new Set(Object.values(attendance).map(r=>r.dept));
+  const pres=presentD.size, total=deptNames.length;
+  if(!total) return;
+  const abs=total-pres, pct=Math.floor(pres*100/total);
+  const ctx=canvas.getContext('2d');
+  const cx=canvas.width/2, cy=canvas.height/2, r=70, ri=45;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const slices=[{val:pres,color:'#0a0a0a'},{val:abs,color:'#e5e5e7'}];
+  let angle=-Math.PI/2;
+  slices.forEach(s=>{ if(!s.val) return; const sw=s.val/total*2*Math.PI; ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,angle,angle+sw); ctx.closePath(); ctx.fillStyle=s.color; ctx.fill(); angle+=sw; });
+  ctx.beginPath(); ctx.arc(cx,cy,ri,0,2*Math.PI); ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--surface').trim()||'#fff'; ctx.fill();
+  ctx.fillStyle='#0a0a0a'; ctx.font='bold 18px Cairo'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(pct+'%',cx,cy-8); ctx.font='11px Cairo'; ctx.fillStyle='#888'; ctx.fillText('حضور',cx,cy+12);
+}
+
+// ════════════════════════════════════
+//  OPEN DISPLAY MODE
+// ════════════════════════════════════
+window.openDisplayMode=function(showPresent=true){
+  const snap_mid=currentMeetId;
+  const base=window.location.origin+window.location.pathname;
+  const link=`${base}?mode=projector&mid=${snap_mid}${showPresent?'&show=present':'&show=absent'}`;
+  window.open(link,'_blank');
+};
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;900&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#d8d8dc;
+  --surface:#ffffff;
+  --surface2:#d0d0d5;
+  --surface3:#c0c0c8;
+  --dark:#0a0a0a;
+  --dark2:#1a1a1a;
+  --dark3:#2a2a2a;
+  --accent:#0066ff;
+  --accent2:#0044cc;
+  --accent-light:#e8f0ff;
+  --text:#0a0a0a;
+  --text2:#2a2a2a;
+  --muted:#888888;
+  --border:#e5e5e7;
+  --border2:#d0d0d5;
+  --success:#00875a;--success-light:#e6f4ef;
+  --error:#cc2200;--error-light:#fff0ee;
+  --warn:#b45309;--warn-light:#fffbeb;--gold:#b45309;
+  --shadow:0 1px 2px rgba(0,0,0,.06),0 4px 12px rgba(0,0,0,.04);
+  --shadow-lg:0 8px 30px rgba(0,0,0,.1);
+  --shadow-xl:0 20px 60px rgba(0,0,0,.15);
+}
+
+/* ══ DARK MODE ══ */
+body.dark-mode #meetingBar{background:linear-gradient(135deg,#0a0a15,#0d1020);}
+body.dark-mode #darkModeBtn{background:rgba(255,255,200,.15);border-color:rgba(255,255,200,.3);}
+body.dark-mode .sub-tab{background:#1c1c22;border-color:#33333d;color:#888899;}
+body.dark-mode .active-sort,.dark-mode .active-filter{background:#e0e0e0!important;color:#0a0a0a!important;}
+body.dark-mode .sort-btn,.dark-mode .filter-btn{background:#26262e!important;color:#ccccdd!important;border-color:#33333d!important;}
+body.dark-mode .card{background:#1c1c22;border-color:#33333d;}
+body.dark-mode .btn-primary{background:#3a3aff;}
+body.dark-mode .success-circle{background:#1a1a3a;}
+body.dark-mode .tbl-card{background:#1c1c22;border-color:#33333d;}
+body.dark-mode thead th{background:#111118;}
+body.dark-mode{
+  --bg:#0f0f12;
+  --surface:#1c1c22;
+  --surface2:#26262e;
+  --surface3:#30303a;
+  --dark:#ffffff;
+  --dark2:#eeeeee;
+  --dark3:#cccccc;
+  --text:#f0f0f5;
+  --text2:#ccccdd;
+  --muted:#888899;
+  --border:#33333d;
+  --border2:#44444e;
+  --accent-light:#1a2a4a;
+  --success-light:#0a2a1a;
+  --error-light:#2a0a08;
+  --warn-light:#2a1a06;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 4px 12px rgba(0,0,0,.2);
+  --shadow-lg:0 8px 30px rgba(0,0,0,.4);
+}
+body.dark-mode .form-input{background:#2a2a34;border-color:#3a3a44;color:#f0f0f5;}
+body.dark-mode .form-input:focus{background:#33333f;border-color:#6060aa;}
+body.dark-mode .role-btn{background:#2a2a34;border-color:#3a3a44;color:#f0f0f5;}
+body.dark-mode .dept-dropdown{background:#1e1e28;border-color:#5050aa;}
+body.dark-mode .dept-option{color:#f0f0f5;border-bottom-color:#2a2a34;}
+body.dark-mode .dept-option:hover,.dept-option.hl{background:#3a3a55;color:#fff;}
+body.dark-mode .tab{color:#666677;}
+body.dark-mode .tab.active{color:#f0f0f5;border-bottom-color:#f0f0f5;}
+body.dark-mode .tabs{background:#1c1c22;border-bottom-color:#33333d;}
+body.dark-mode .admin-sidebar{background:#111118;}
+body.dark-mode .tbl-header{background:#111118;}
+body.dark-mode tbody tr:hover{background:#26262e;}
+body.dark-mode .stamp{background:#111118;}
+body.dark-mode .stat-card{background:#111118;}
+body.dark-mode .success-card{background:#26262e;border-color:#33333d;}
+body.dark-mode .success-locked{background:#1c1c22;}
+body.dark-mode .archive-item{background:#1c1c22;}
+body.dark-mode .wa-item{background:#26262e;}
+body.dark-mode .modal-box{background:#1c1c22;border-color:#33333d;}
+body.dark-mode #authInput{background:#2a2a34;border-color:#3a3a44;color:#f0f0f5;}
+body.dark-mode .sort-btn,.dark-mode .filter-btn{background:#2a2a34!important;color:#f0f0f5!important;border-color:#3a3a44!important;}
+body.dark-mode .active-sort,.dark-mode .active-filter{background:#ffffff!important;color:#0a0a0a!important;}
+body{font-family:'Cairo',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
+
+/* HEADER */
+.header{background:var(--dark);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.header-brand{display:flex;align-items:center;gap:12px}
+.logo-dot{width:40px;height:40px;border-radius:12px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:20px}
+.header-title{font-size:16px;font-weight:800;color:#fff}
+.header-sub{font-size:11px;color:rgba(255,255,255,.5)}
+.live-badge{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);border-radius:20px;padding:6px 14px;font-size:12px;color:#fff;font-weight:600}
+.live-dot{width:7px;height:7px;border-radius:50%;background:#00d084;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.7)}}
+@keyframes loading{0%{transform:translateX(-100%)}50%{transform:translateX(0)}100%{transform:translateX(100%)}}
+
+/* TABS */
+.tabs{display:flex;background:var(--surface);border-bottom:2px solid var(--border);padding:0 20px;overflow-x:auto;gap:0}
+.tab{padding:14px 14px;font-family:'Cairo',sans-serif;font-size:13px;font-weight:600;color:var(--muted);background:none;border:none;border-bottom:2px solid transparent;margin-bottom:-2px;cursor:pointer;transition:all .2s;white-space:nowrap;display:flex;align-items:center;gap:5px}
+.tab.active{color:var(--dark);border-bottom-color:var(--dark)}
+.tab:hover:not(.active){color:var(--text2);background:var(--surface2)}
+
+/* MAIN */
+.main{flex:1;padding:20px;max-width:960px;margin:0 auto;width:100%}
+.page{display:none}.page.active{display:block}
+
+/* CARDS */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card-title{font-size:15px;font-weight:800;margin-bottom:18px;display:flex;align-items:center;gap:8px;color:var(--text)}
+.card-dark{background:var(--dark2);border-color:var(--dark3);color:#fff}
+.card-dark .card-title{color:#fff}
+
+/* FORM */
+.form-group{margin-bottom:18px}
+.form-label{display:block;font-size:13px;font-weight:800;color:var(--text2);margin-bottom:9px;letter-spacing:.3px}
+.form-label span{color:var(--error)}
+.form-input{width:100%;padding:14px 16px;background:#d4d4d8;border:1.5px solid #d4d4d8;border-radius:12px;color:#0a0a0a;font-family:'Cairo',sans-serif;font-size:16px;transition:all .2s;outline:none}
+.form-input:focus{border-color:var(--dark);background:#bebec4;box-shadow:0 0 0 3px rgba(0,0,0,.1)}
+.form-input::placeholder{color:var(--muted)}
+textarea.form-input{resize:vertical;min-height:85px;line-height:1.7}
+
+/* DEPT SEARCH */
+.search-wrap{position:relative}
+.search-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:15px;pointer-events:none}
+.dept-dropdown{display:none;position:absolute;top:calc(100% + 4px);right:0;left:0;background:#f0f0f3;border:1.5px solid var(--dark);border-radius:12px;z-index:50;max-height:180px;overflow-y:auto;box-shadow:var(--shadow-lg)}
+.dept-dropdown.open{display:block}
+.dept-option{padding:13px 15px;cursor:pointer;font-size:15px;font-weight:600;transition:background .12s;color:#0a0a0a;border-bottom:1px solid #e5e5e7}
+.dept-option:hover,.dept-option.hl{background:var(--dark);color:#fff}
+.dept-option.no-res{color:var(--muted);cursor:default}
+
+/* ROLE */
+.role-group{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.role-btn{padding:16px 14px;border-radius:14px;border:1.5px solid #c0c0c8;background:#d4d4d8;color:#0a0a0a;font-family:'Cairo',sans-serif;font-size:15px;font-weight:700;cursor:pointer;transition:all .25s cubic-bezier(.175,.885,.32,1.275);text-align:center}
+.role-btn:hover{border-color:var(--dark);background:var(--dark);color:#fff}
+.role-btn.sel-pres{border-color:var(--dark);background:var(--dark);color:#fff}
+.role-btn.sel-dep{border-color:var(--dark3);background:var(--dark2);color:#fff}
+
+/* BUTTONS */
+.btn{padding:12px 20px;border:none;border-radius:10px;font-family:'Cairo',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:all .18s;display:inline-flex;align-items:center;gap:7px}
+.btn-primary{background:var(--dark);color:#fff;width:100%;justify-content:center;font-size:16px;padding:15px}
+.btn-primary:hover{background:var(--dark2);transform:translateY(-1px);box-shadow:var(--shadow-lg)}
+.btn-sm{padding:7px 14px;font-size:12px;border-radius:8px}
+.btn-green{background:var(--success-light);border:1px solid rgba(0,135,90,.2);color:var(--success)}.btn-green:hover{background:#d1f0e6}
+.btn-red{background:var(--error-light);border:1px solid rgba(204,34,0,.2);color:var(--error)}.btn-red:hover{background:#ffe0dc}
+.btn-yellow{background:var(--warn-light);border:1px solid rgba(180,83,9,.2);color:var(--warn)}.btn-yellow:hover{background:#fef3c7}
+.btn-blue{background:var(--accent-light);border:1px solid rgba(0,102,255,.2);color:var(--accent)}.btn-blue:hover{background:#d8e8ff}
+.btn-dark{background:var(--dark);color:#fff;border:none}.btn-dark:hover{background:var(--dark3)}
+.btn-whatsapp{background:#25D366;color:#fff;border:none}.btn-whatsapp:hover{background:#1da851}
+
+/* ALERTS */
+.alert{display:none;padding:13px 16px;border-radius:12px;font-size:13px;font-weight:600;margin-top:14px;align-items:center;gap:9px}
+.alert.show{display:flex}
+.alert-success{background:var(--success-light);border:1px solid rgba(0,135,90,.2);color:var(--success)}
+.alert-error{background:var(--error-light);border:1px solid rgba(204,34,0,.2);color:var(--error)}
+
+/* STATS */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.stat-card{background:var(--dark);border-radius:14px;padding:16px;text-align:center}
+.stat-num{font-size:28px;font-weight:900;color:#fff}
+.stat-num.accent{color:#60a5ff}
+.stat-num.red{color:#ff6b6b}
+.stat-label{font-size:10px;color:rgba(255,255,255,.5);margin-top:4px;font-weight:600}
+
+/* STAMP */
+.stamp{background:var(--dark);border-radius:16px;padding:16px 20px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+.stamp-info{display:flex;flex-direction:column;gap:2px}
+.stamp-lbl{font-size:10px;color:rgba(255,255,255,.45);font-weight:600}
+.stamp-val{font-size:13px;font-weight:700;color:#fff}
+.stamp-badge{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);color:#fff;border-radius:9px;padding:5px 13px;font-size:12px;font-weight:700}
+
+/* SUB TABS */
+.sub-tabs{display:flex;gap:8px;margin-bottom:16px}
+.sub-tab{flex:1;padding:11px;border-radius:10px;border:1.5px solid var(--border);background:var(--surface);color:var(--muted);font-family:'Cairo',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s;text-align:center;box-shadow:var(--shadow)}
+.sub-tab.act-pres{border-color:var(--success);background:var(--success-light);color:var(--success)}
+.sub-tab.act-abs{border-color:var(--error);background:var(--error-light);color:var(--error)}
+
+/* TABLE */
+.tbl-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden;margin-bottom:16px;box-shadow:var(--shadow)}
+.tbl-header{padding:14px 18px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px;background:var(--dark)}
+.tbl-title{font-weight:800;font-size:14px;color:#fff}
+.btn-row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{background:var(--surface2);padding:11px 14px;text-align:right;font-size:11px;font-weight:700;color:var(--muted);border-bottom:1px solid var(--border)}
+tbody tr{border-bottom:1px solid var(--border);transition:background .12s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:var(--surface2)}
+td{padding:11px 14px;vertical-align:middle;color:var(--text)}
+.row-num{width:26px;height:26px;border-radius:6px;background:var(--surface3);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--muted)}
+.badge{display:inline-flex;align-items:center;gap:3px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700}
+.b-pres{background:var(--dark);color:#fff}
+.b-dep{background:var(--dark3);color:#fff}
+.b-abs{background:var(--error-light);color:var(--error);border:1px solid rgba(204,34,0,.2)}
+.empty-state{padding:50px 20px;text-align:center;color:var(--muted)}
+
+/* ══ PROGRESS BAR ══ */
+.reg-progress{display:flex;align-items:center;gap:0;margin-bottom:24px;padding:0 4px}
+.reg-step{display:flex;flex-direction:column;align-items:center;flex:1;position:relative}
+.reg-step:not(:last-child)::after{content:'';position:absolute;top:16px;right:calc(-50%);width:100%;height:2px;background:var(--border);z-index:0;transition:background .4s}
+.reg-step.done:not(:last-child)::after{background:var(--success)}
+.reg-step.active:not(:last-child)::after{background:var(--border)}
+.reg-dot{width:32px;height:32px;border-radius:50%;background:var(--surface2);border:2px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:var(--muted);z-index:1;transition:all .3s}
+.reg-step.done .reg-dot{background:var(--success);border-color:var(--success);color:#fff}
+.reg-step.active .reg-dot{background:var(--dark);border-color:var(--dark);color:#fff;transform:scale(1.15)}
+.reg-step-label{font-size:10px;font-weight:700;color:var(--muted);margin-top:5px;transition:color .3s}
+.reg-step.active .reg-step-label{color:var(--dark)}
+.reg-step.done .reg-step-label{color:var(--success)}
+
+/* ══ FIELD CONFIRM ══ */
+.form-input.confirmed{background:#e8f5ef!important;border-color:var(--success)!important;}
+body.dark-mode .form-input.confirmed{background:#0a2a1a!important;border-color:var(--success)!important;}
+.role-btn.sel-pres{border-color:var(--dark);background:var(--dark);color:#fff;transform:scale(1.04);box-shadow:0 4px 14px rgba(0,0,0,.18)}
+.role-btn.sel-dep{border-color:var(--dark3);background:var(--dark2);color:#fff;transform:scale(1.04);box-shadow:0 4px 14px rgba(0,0,0,.18)}
+
+/* ══ ANIMATIONS ══ */
+@keyframes successPop{0%{transform:scale(0) rotate(-10deg);opacity:0}60%{transform:scale(1.15) rotate(3deg)}100%{transform:scale(1) rotate(0);opacity:1}}
+@keyframes successFade{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+@keyframes confetti{0%{transform:translateY(0) rotate(0);opacity:1}100%{transform:translateY(-120px) rotate(720deg);opacity:0}}
+@keyframes ripple{0%{transform:scale(0);opacity:.5}100%{transform:scale(4);opacity:0}}
+
+/* ══ SPACING ══ */
+.form-group{margin-bottom:22px}
+.card{padding:28px}
+.sort-btn,.filter-btn{transition:all .2s}
+.active-sort,.active-filter{background:var(--dark)!important;color:#fff!important;border-color:var(--dark)!important}
+.empty-icon{font-size:44px;margin-bottom:12px;opacity:.5}.empty-text{font-size:14px;font-weight:600}
+
+/* WHATSAPP */
+.wa-item{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--surface2);border-radius:12px;border:1px solid var(--border);margin-bottom:8px;gap:10px;flex-wrap:wrap}
+.wa-dept-name{font-weight:700;font-size:14px;flex:1;color:var(--text)}
+.wa-phone{padding:8px 12px;background:var(--surface);border:1.5px solid var(--border);border-radius:8px;color:var(--text);font-family:'Cairo',sans-serif;font-size:13px;outline:none;width:150px;direction:ltr}
+.wa-phone:focus{border-color:var(--dark)}
+
+/* ARCHIVE */
+.archive-item{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;background:var(--surface);border-radius:14px;border:1px solid var(--border);margin-bottom:10px;gap:12px;flex-wrap:wrap;box-shadow:var(--shadow);transition:all .2s}
+.archive-item:hover{box-shadow:var(--shadow-lg);border-color:var(--dark)}
+.archive-info{flex:1}
+.archive-title{font-weight:800;font-size:14px;margin-bottom:4px;color:var(--text)}
+.archive-meta{font-size:12px;color:var(--muted)}
+.archive-actions{display:flex;gap:7px}
+
+/* MODAL */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(6px);z-index:999;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:32px 28px;width:min(380px,92vw);text-align:center;box-shadow:var(--shadow-xl)}
+
+/* ADMIN SIDEBAR LAYOUT */
+.admin-layout{display:flex;gap:0;min-height:500px;background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden;box-shadow:var(--shadow)}
+.admin-sidebar{width:200px;flex-shrink:0;background:var(--dark);padding:8px}
+.admin-sidebar-item{display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:10px;cursor:pointer;transition:all .15s;font-family:'Cairo',sans-serif;font-size:13px;font-weight:600;color:rgba(255,255,255,.6);border:none;background:none;width:100%;text-align:right}
+.admin-sidebar-item:hover{background:rgba(255,255,255,.08);color:#fff}
+.admin-sidebar-item.active{background:rgba(255,255,255,.15);color:#fff}
+.admin-sidebar-item .icon{font-size:16px;width:20px;text-align:center}
+.admin-sidebar-divider{height:1px;background:rgba(255,255,255,.08);margin:6px 8px}
+.admin-content{flex:1;padding:24px;overflow-y:auto;min-width:0}
+.admin-section{display:none}.admin-section.active{display:block}
+.admin-section-title{font-size:18px;font-weight:900;color:var(--text);margin-bottom:20px;padding-bottom:12px;border-bottom:2px solid var(--border)}
+
+/* CONTACT */
+.contact-box{margin-top:16px;padding:18px 20px;background:var(--surface);border:1px solid var(--border);border-radius:16px;text-align:center;box-shadow:var(--shadow)}
+.contact-title{font-size:14px;font-weight:800;color:var(--text);margin-bottom:12px}
+.contact-actions{display:flex;justify-content:center;gap:16px}
+.contact-btn{width:52px;height:52px;border-radius:50%;display:flex;align-items:center;justify-content:center;text-decoration:none;transition:transform .18s,box-shadow .18s;box-shadow:var(--shadow)}
+.contact-btn:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
+.contact-btn svg{width:26px;height:26px}
+.contact-call{background:var(--dark)}
+.contact-call svg{fill:var(--surface)}
+.contact-wa{background:#25D366}
+.contact-wa svg{fill:#fff}
+.contact-num{margin-top:10px;font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.5px}
+
+/* SUCCESS PAGE */
+.success-page{text-align:center;padding:20px;animation:fadeUp .5s ease}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+.success-circle{width:96px;height:96px;border-radius:50%;background:var(--dark);display:flex;align-items:center;justify-content:center;font-size:44px;margin:0 auto 20px;box-shadow:var(--shadow-lg);animation:popIn .5s cubic-bezier(.175,.885,.32,1.275)}
+@keyframes popIn{from{transform:scale(0)}to{transform:scale(1)}}
+.success-card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:18px 22px;margin:16px auto 0;max-width:380px;text-align:right}
+.success-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border)}
+.success-row:last-child{border-bottom:none}
+.success-row-label{font-size:12px;color:var(--muted);font-weight:600}
+.success-row-value{font-size:13px;font-weight:700;color:var(--text)}
+.success-locked{background:var(--dark);border-radius:12px;padding:12px 16px;margin-top:14px;font-size:13px;color:#fff;font-weight:600;display:flex;align-items:center;gap:8px;max-width:380px;margin-left:auto;margin-right:auto}
+
+@media(max-width:600px){
+  .stats-grid{grid-template-columns:repeat(2,1fr)}
+  .main{padding:12px}.card{padding:16px 14px}
+  thead th:nth-child(6),td:nth-child(6){display:none}
+  .stamp{flex-direction:column}
+  .header{padding:10px 14px}
+  .admin-layout{flex-direction:column}
+  .admin-sidebar{width:100%;display:flex;flex-wrap:nowrap;overflow-x:auto;padding:8px;gap:4px}
+  .admin-sidebar-item{white-space:nowrap;flex-shrink:0}
+  .admin-sidebar-divider{display:none}
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-brand">
+    <img src="data:image/jpeg;base64,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" id="headerLogo" style="width:44px;height:44px;border-radius:10px;object-fit:contain;background:#fff;padding:3px;flex-shrink:0">
+    <div>
+      <div class="header-title" id="headerTitle">محافظة الغربية</div>
+      <div class="header-sub" id="dateDisplay"></div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <button id="darkModeBtn" onclick="toggleDarkMode()"
+      style="width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);color:#fff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .3s"
+      title="الوضع الليلي">🌙</button>
+    <div class="live-badge"><div class="live-dot"></div><span id="syncDot">جاري الاتصال...</span></div>
+  </div>
+</div>
+
+<!-- شريط اسم الاجتماع -->
+<div id="meetingBar" style="background:linear-gradient(135deg,#1a1a2e,#16213e);padding:8px 24px;display:none;align-items:center;justify-content:center;border-bottom:1px solid rgba(255,255,255,.08)">
+  <div id="meetingBarName" style="font-size:13px;font-weight:700;color:rgba(255,255,255,.75);text-align:center;letter-spacing:.3px">⏳ جاري التحميل...</div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" id="tabRegister"  onclick="switchTab('register')">✏️ تسجيل</button>
+  <button class="tab" id="tabAttendance"        onclick="switchTab('attendance')" style="display:none">📊 الكشف</button>
+  <button class="tab" id="tabArchive"           onclick="switchTab('archive')" style="display:none">🗂️ الأرشيف</button>
+  <button class="tab" id="tabAdminPage"         onclick="switchTab('adminpage')" style="display:none">⚙️ إعدادات</button>
+  <button class="tab" id="tabManagerBtn"        onclick="openAuthModal('manager')" style="color:var(--accent)">🔑 رئيس الاجتماع</button>
+  <button class="tab" id="tabAdminToggle" onclick="isAdminMode?openAuthModal('disableAdmin'):openAuthModal('admin')" style="color:var(--warn)">🔐 أدمن</button>
+  <!-- الواتساب مخفي في الشريط - بيتفتح من الإعدادات -->
+  <button class="tab" id="tabWhatsapp" onclick="switchTab('whatsapp')" style="display:none">💬 واتساب</button>
+</div>
+
+<!-- AUTH MODAL -->
+<div class="modal-overlay" id="authOverlay">
+  <div class="modal-box">
+    <div id="authIcon" style="font-size:40px;margin-bottom:10px">🔒</div>
+    <div id="authTitle" style="font-size:19px;font-weight:800;margin-bottom:6px"></div>
+    <div id="authSub" style="color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.6"></div>
+    <input type="password" id="authInput" maxlength="10"
+      style="width:100%;padding:14px;text-align:center;font-size:26px;letter-spacing:8px;background:var(--surface2);border:1.5px solid var(--border);border-radius:11px;color:var(--text);font-family:'Cairo',sans-serif;outline:none"
+      placeholder="••••" onkeydown="if(event.key==='Enter')checkAuth()">
+    <div id="authAttempts" style="color:var(--warn);font-size:12px;margin-top:8px;min-height:18px"></div>
+    <div id="authError" style="color:var(--error);font-size:13px;margin-top:4px;min-height:18px;font-weight:600"></div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button onclick="closeAuthModal()" style="flex:1;padding:13px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--muted);font-family:'Cairo',sans-serif;font-size:14px;cursor:pointer">إلغاء</button>
+      <button id="authSubmit" onclick="checkAuth()" style="flex:1;padding:13px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:10px;color:#fff;font-family:'Cairo',sans-serif;font-size:15px;font-weight:700;cursor:pointer">دخول ✓</button>
+    </div>
+  </div>
+</div>
+
+<!-- ARCHIVE MODAL -->
+<div class="modal-overlay" id="archiveModal">
+  <div class="modal-box" style="width:min(700px,95vw);text-align:right;max-height:90vh;overflow-y:auto">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <div style="font-size:17px;font-weight:800" id="archiveModalTitle"></div>
+      <button onclick="closeArchiveModal()" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;color:var(--muted);cursor:pointer;font-family:'Cairo',sans-serif">✕</button>
+    </div>
+    <div id="archiveModalBody"></div>
+  </div>
+</div>
+
+<div class="main">
+
+<!-- PROJECTOR PAGE -->
+<div class="page" id="page-projector" style="display:none;padding:0">
+  <div id="projContent">
+    <div style="text-align:center;padding:80px 20px;color:#888;font-family:'Cairo',sans-serif">
+      <div style="font-size:40px;margin-bottom:16px">📺</div>
+      <div style="font-size:16px">جاري تحميل البيانات...</div>
+    </div>
+  </div>
+</div>
+
+<!-- REGISTER -->
+<div class="page active" id="page-register">
+
+  <!-- شاشة الانتظار -->
+  <div id="waitScreen" style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;text-align:center">
+    <div style="width:90px;height:90px;border-radius:50%;background:linear-gradient(135deg,#1a1a2e,#16213e);display:flex;align-items:center;justify-content:center;font-size:42px;margin-bottom:20px">⏳</div>
+    <div style="font-size:22px;font-weight:900;color:var(--text);margin-bottom:8px">في انتظار فتح التسجيل</div>
+    <div style="font-size:14px;color:var(--muted);line-height:1.8;max-width:280px">سيتم فتح التسجيل قريباً من قِبَل رئيس الاجتماع — الصفحة تتحدث تلقائياً</div>
+    <div style="margin-top:24px;display:flex;gap:6px">
+      <div style="width:8px;height:8px;border-radius:50%;background:var(--dark);animation:pulse 1.2s ease-in-out infinite"></div>
+      <div style="width:8px;height:8px;border-radius:50%;background:var(--dark);animation:pulse 1.2s ease-in-out .2s infinite"></div>
+      <div style="width:8px;height:8px;border-radius:50%;background:var(--dark);animation:pulse 1.2s ease-in-out .4s infinite"></div>
+    </div>
+  </div>
+
+  <!-- فورم التسجيل -->
+  <div id="regFormContent" style="display:none">
+  <div id="adminBanner" style="display:none;align-items:center;gap:10px;background:rgba(255,77,109,.1);border:1px solid rgba(255,77,109,.3);border-radius:13px;padding:11px 16px;margin-bottom:14px;font-size:13px;font-weight:700;color:var(--error)">
+    <span style="font-size:18px">🔓</span><span>وضع الأدمن — يمكنك تسجيل الحضور بدلاً عن أي شخص</span>
+  </div>
+
+  <!-- رسالة الترحيب -->
+  <div id="welcomeBox" style="display:none;background:linear-gradient(135deg,rgba(0,212,170,.1),rgba(0,128,255,.1));border:1px solid rgba(0,212,170,.3);border-radius:14px;padding:14px 18px;margin-bottom:14px;text-align:center">
+    <div style="font-size:16px;font-weight:700;color:var(--accent)" id="welcomeMsg"></div>
+  </div>
+
+  <!-- زرار إعادة الشرح -->
+  <div style="text-align:left;margin-bottom:10px">
+    <button onclick="restartTour()" style="background:transparent;border:1px solid var(--border);border-radius:8px;padding:5px 12px;color:var(--muted);font-family:'Cairo',sans-serif;font-size:12px;cursor:pointer">❓ شرح خطوات التسجيل</button>
+  </div>
+  <div class="card">
+    <div style="text-align:center;margin-bottom:24px">
+      <div style="width:64px;height:64px;border-radius:17px;background:linear-gradient(135deg,rgba(0,212,170,.15),rgba(0,128,255,.15));border:1px solid rgba(0,212,170,.3);display:flex;align-items:center;justify-content:center;font-size:28px;margin:0 auto 12px">🏛️</div>
+      <div style="font-size:22px;font-weight:900;margin-bottom:6px">تسجيل الحضور</div>
+      <div style="color:var(--muted);font-size:13px">اختر جهتك ثم اكتب اسمك وصفتك</div>
+    </div>
+
+    <!-- Progress Bar — يتبنى ديناميكياً بناءً على الحقول المفعلة -->
+    <div class="reg-progress" id="regProgress">
+      <!-- يتملى تلقائياً من buildProgressSteps() -->
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">🏢 الجهة <span>*</span></label>
+      <div class="search-wrap" id="deptWrap">
+        <input type="text" class="form-input" id="deptSearch" placeholder="ابحث أو اختر الجهة..." autocomplete="off"
+          oninput="filterDepts()" onfocus="openDeptDd()" onkeydown="deptNav(event)" style="padding-left:38px">
+        <span class="search-icon">🔍</span>
+        <div class="dept-dropdown" id="deptDd"></div>
+      </div>
+      <input type="hidden" id="deptVal">
+    </div>
+
+    <div class="form-group" id="nameGroup">
+      <label class="form-label">👤 الاسم الكامل <span>*</span></label>
+      <input type="text" class="form-input" id="nameInput" placeholder="اكتب اسمك الكامل هنا..." autocomplete="off" oninput="updateProgress()">
+    </div>
+
+    <div class="form-group" id="roleGroup">
+      <label class="form-label" id="roleLabel">🎖️ الصفة في الاجتماع</label>
+      <div class="role-group">
+        <button class="role-btn" id="btnPres" onclick="selectRole('president')">🔵 رئيس الجهة</button>
+        <button class="role-btn" id="btnDep"  onclick="selectRole('deputy')">🟡 نائب عن الرئيس</button>
+      </div>
+    </div>
+
+    <div class="form-group" id="codeGroup" style="display:none">
+      <label class="form-label">🔑 الكود السري للجهة</label>
+      <input type="text" class="form-input" id="deptCode" placeholder="أدخل الكود..." maxlength="4"
+        style="text-align:center;font-size:22px;font-weight:900;letter-spacing:8px;text-transform:uppercase" autocomplete="off">
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">💬 ملاحظة (اختياري)</label>
+      <input type="text" class="form-input" id="noteInput" placeholder="أي ملاحظة إضافية...">
+    </div>
+
+    <button id="regBtn" class="btn btn-primary" onclick="regBtnClick(event)" style="position:relative;overflow:hidden;font-size:17px;padding:17px;letter-spacing:.3px">
+  ✅ تسجيل الحضور
+</button>
+    <div class="alert alert-success" id="successAlert"><span>✅</span><span id="successMsg"></span></div>
+    <div class="alert alert-error"   id="errorAlert"><span>⚠️</span><span id="errorMsg"></span></div>
+  </div>
+  </div><!-- end regFormContent -->
+
+  <!-- تواصل معنا -->
+  <div class="contact-box" id="contactBox">
+    <div class="contact-title">📞 تواصل معنا لأي استفسار</div>
+    <div class="contact-actions">
+      <a class="contact-btn contact-call" href="tel:01098950572" title="اتصال هاتفي" aria-label="اتصال هاتفي">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/></svg>
+      </a>
+      <a class="contact-btn contact-wa" href="https://wa.me/201098950572" target="_blank" rel="noopener noreferrer" title="واتساب" aria-label="واتساب">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+      </a>
+    </div>
+    <div class="contact-num" dir="ltr">01098950572</div>
+  </div>
+</div>
+
+<!-- ATTENDANCE -->
+<div class="page" id="page-attendance">
+  <!-- Alert خاص بصفحة الكشف -->
+  <div class="alert alert-success" id="attendanceSuccessAlert" style="margin-bottom:12px"><span>✅</span><span id="attendanceSuccessMsg"></span></div>
+  <div class="alert alert-error"   id="attendanceErrorAlert"   style="margin-bottom:12px"><span>⚠️</span><span id="attendanceErrorMsg"></span></div>
+  <div class="stamp">
+    <div class="stamp-info"><div class="stamp-lbl">📅 تاريخ الاجتماع</div><div class="stamp-val" id="stDate">—</div></div>
+    <div class="stamp-info"><div class="stamp-lbl">🕐 بدأ الاجتماع</div><div class="stamp-val" id="stStart">—</div></div>
+    <div class="stamp-info"><div class="stamp-lbl">⏱️ أول تسجيل</div><div class="stamp-val" id="stFirst">—</div></div>
+    <div class="stamp-info"><div class="stamp-lbl">⏱️ آخر تسجيل</div><div class="stamp-val" id="stLast">—</div></div>
+    <div class="stamp-badge" id="stElapsed">—</div>
+  </div>
+  <div class="stats-grid" style="grid-template-columns:repeat(3,1fr)">
+    <div class="stat-card"><div class="stat-num" id="stTotalDepts">0</div><div class="stat-label">🏛️ إجمالي الجهات</div></div>
+    <div class="stat-card"><div class="stat-num" id="stAbsent" style="background:linear-gradient(135deg,#ff4d6d,#ff8c00);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text">0</div><div class="stat-label">❌ جهات غائبة</div></div>
+    <div class="stat-card"><div class="stat-num" id="stPct">0%</div><div class="stat-label">📊 نسبة الحضور</div></div>
+  </div>
+  <input type="hidden" id="stPersons" value="0">
+  <div class="sub-tabs">
+    <button class="sub-tab act-pres" id="subPres" onclick="switchSub('present')">✅ الحاضرون (<span id="cntPres">0</span>)</button>
+    <button class="sub-tab"          id="subAbs"  onclick="switchSub('absent')">❌ لم يحضروا (<span id="cntAbs">0</span>)</button>
+  </div>
+  <div id="panelPres">
+    <!-- مخطط دائري + بحث -->
+    <div style="display:flex;gap:14px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+      <canvas id="attendanceChart" width="160" height="160" style="flex-shrink:0"></canvas>
+      <div style="flex:1;min-width:180px">
+        <input type="text" id="attendanceSearch" class="form-input" placeholder="🔍 ابحث باسم أو جهة..."
+          oninput="filterAttendance()" style="margin-bottom:10px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:6px;font-size:13px"><span style="width:12px;height:12px;border-radius:50%;background:#00d4aa;display:inline-block"></span>حضر</div>
+          <div style="display:flex;align-items:center;gap:6px;font-size:13px"><span style="width:12px;height:12px;border-radius:50%;background:#ff4d6d;display:inline-block"></span>غائب</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- أزرار الترتيب والفلترة -->
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center">
+      <span style="font-size:12px;font-weight:700;color:var(--muted)">ترتيب:</span>
+      <button id="sort-time"  class="sort-btn active-sort" onclick="setSortMode('time')"  style="padding:6px 12px;border-radius:8px;border:1.5px solid var(--border);background:var(--dark);color:#fff;font-family:'Cairo',sans-serif;font-size:12px;font-weight:700;cursor:pointer">⏱️ وقت التسجيل</button>
+      <button id="sort-alpha" class="sort-btn"             onclick="setSortMode('alpha')" style="padding:6px 12px;border-radius:8px;border:1.5px solid var(--border);background:var(--surface);color:var(--text);font-family:'Cairo',sans-serif;font-size:12px;font-weight:700;cursor:pointer">أ-ي أبجدي</button>
+      <span style="font-size:12px;font-weight:700;color:var(--muted);margin-right:8px">فلترة:</span>
+      <button id="filter-all"       class="filter-btn active-filter" onclick="setFilterMode('all')"       style="padding:6px 12px;border-radius:8px;border:1.5px solid var(--border);background:var(--dark);color:#fff;font-family:'Cairo',sans-serif;font-size:12px;font-weight:700;cursor:pointer">الكل</button>
+      <button id="filter-president" class="filter-btn"               onclick="setFilterMode('president')" style="padding:6px 12px;border-radius:8px;border:1.5px solid var(--border);background:var(--surface);color:var(--text);font-family:'Cairo',sans-serif;font-size:12px;font-weight:700;cursor:pointer">🔵 رؤساء فقط</button>
+      <button id="filter-deputy"    class="filter-btn"               onclick="setFilterMode('deputy')"    style="padding:6px 12px;border-radius:8px;border:1.5px solid var(--border);background:var(--surface);color:var(--text);font-family:'Cairo',sans-serif;font-size:12px;font-weight:700;cursor:pointer">🟡 نواب فقط</button>
+    </div>
+    <div class="tbl-card">
+      <div class="tbl-header">
+        <div class="tbl-title">✅ قائمة الحاضرين</div>
+        <div class="btn-row">
+          <button class="btn btn-sm btn-dark" onclick="toggleToolsMenu()" id="toolsMenuBtn">🛠️ أدوات ▾</button>
+        </div>
+      </div>
+      <!-- قائمة الأدوات -->
+      <div id="toolsMenu" style="display:none;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--surface2)">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <!-- فتح/إغلاق التسجيل -->
+          <button id="regOpenBtn" onclick="toggleRegistration()"
+            style="padding:7px 14px;border-radius:8px;border:1px solid rgba(0,135,90,.2);background:var(--success-light);color:var(--success);font-family:'Cairo',sans-serif;font-size:12px;font-weight:700;cursor:pointer">
+            🔓 فتح التسجيل
+          </button>
+          <!-- رئيس الاجتماع -->
+          <button class="btn btn-sm btn-dark" onclick="openDisplayMode(true)">📺 بروجيكتور</button>
+          <button class="btn btn-sm btn-dark" onclick="getProjectorLink()" style="background:var(--dark3)">🔗 رابط البروجيكتور</button>
+          <!-- أدمن فقط -->
+          <span id="adminAttendanceBtns" style="display:none;gap:7px;align-items:center;flex-wrap:wrap">
+            <button class="btn btn-sm btn-green" onclick="copyMeetingLink()">🔗 رابط التسجيل</button>
+            <button class="btn btn-sm btn-green" onclick="printAttendance()">🖨️ طباعة</button>
+            <button class="btn btn-sm btn-green" onclick="exportExcel()">⬇️ Excel</button>
+            <button class="btn btn-sm btn-red"   onclick="clearAttendance()">🗑️ مسح الكل</button>
+            <button class="btn btn-sm" style="background:var(--error-light);border:1px solid rgba(204,34,0,.3);color:var(--error)" onclick="closeMeeting()">🔒 إنهاء الاجتماع</button>
+          </span>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table><thead><tr><th>#</th><th>الجهة</th><th>الاسم</th><th>الصفة</th><th>الوقت</th><th style="width:70px"></th></tr></thead>
+        <tbody id="presentTbody"></tbody></table>
+      </div>
+      <div class="empty-state" id="emptyPres"><div class="empty-icon">📭</div><div class="empty-text">لا يوجد حضور مسجل بعد</div></div>
+    </div>
+  </div>
+  <div id="panelAbs" style="display:none">
+    <div class="tbl-card">
+      <div class="tbl-header"><div class="tbl-title">❌ الجهات الغائبة</div></div>
+      <div style="overflow-x:auto">
+        <table><thead><tr><th>#</th><th>الجهة</th><th>الحالة</th></tr></thead>
+        <tbody id="absentTbody"></tbody></table>
+      </div>
+      <div class="empty-state" id="emptyAbs" style="display:none"><div class="empty-icon">🎉</div><div class="empty-text">جميع الجهات حضرت!</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- WHATSAPP -->
+<div class="page" id="page-whatsapp">
+  <div class="card">
+    <div class="card-title">💬 إرسال تذكير واتساب للغائبين</div>
+    <div class="form-group">
+      <label class="form-label">✍️ صِغ رسالتك — استخدم <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;color:var(--accent)">{جهة}</code> ليُستبدل باسم الجهة</label>
+      <textarea class="form-input" id="waMessage" placeholder="مثال: السلام عليكم، نذكركم بحضور اجتماع اليوم. الجهة: {جهة}. شكراً."></textarea>
+    </div>
+    <div style="background:rgba(37,211,102,.07);border:1px solid rgba(37,211,102,.2);border-radius:11px;padding:13px;margin-bottom:16px;font-size:13px;color:#86efac;line-height:1.8">
+      💡 أضف رقم الهاتف لكل جهة ثم اضغط زرار الواتساب
+    </div>
+    <div id="waLinksContainer"></div>
+    <div id="waAbsentList" style="margin-top:14px"></div>
+  </div>
+</div>
+
+<!-- ARCHIVE -->
+<div class="page" id="page-archive">
+  <div class="card">
+    <div class="card-title">🗂️ أرشيف الاجتماعات</div>
+    <div id="archiveList"><div class="empty-state"><div class="empty-icon">📁</div><div class="empty-text">جاري التحميل...</div></div></div>
+  </div>
+</div>
+
+<!-- ADMIN -->
+<div class="page" id="page-adminpage">
+  <div class="admin-layout">
+
+    <!-- SIDEBAR -->
+    <div class="admin-sidebar">
+      <button class="admin-sidebar-item active" onclick="showAdminSection('welcome',this)">
+        <span class="icon">📢</span> رسالة الترحيب
+      </button>
+      <button class="admin-sidebar-item" onclick="showAdminSection('qrcode',this)">
+        <span class="icon">📱</span> QR Code
+      </button>
+      <button class="admin-sidebar-item" onclick="showAdminSection('fields',this)">
+        <span class="icon">🔧</span> الحقول الإلزامية
+      </button>
+      <div class="admin-sidebar-divider"></div>
+      <button class="admin-sidebar-item" onclick="showAdminSection('depts',this)">
+        <span class="icon">🏢</span> إدارة الجهات
+      </button>
+      <button class="admin-sidebar-item" onclick="showAdminSection('codes',this)">
+        <span class="icon">🔑</span> الأكواد السرية
+      </button>
+      <div class="admin-sidebar-divider"></div>
+      <button class="admin-sidebar-item" onclick="showAdminSection('meeting',this)">
+        <span class="icon">📅</span> إدارة الاجتماع
+      </button>
+      <div class="admin-sidebar-divider"></div>
+      <button class="admin-sidebar-item" onclick="showAdminSection('whatsapp',this)">
+        <span class="icon">💬</span> واتساب الغائبين
+      </button>
+      <div class="admin-sidebar-divider"></div>
+      <button class="admin-sidebar-item" onclick="showAdminSection('firebase',this)">
+        <span class="icon">🔥</span> Firebase
+      </button>
+    </div>
+
+    <!-- CONTENT -->
+    <div class="admin-content">
+
+      <!-- QR Code -->
+      <div class="admin-section" id="asec-qrcode">
+        <div class="admin-section-title">📱 QR Code للتسجيل</div>
+        <div style="text-align:center;padding:20px">
+          <div id="qrDisplay" style="margin:0 auto 16px;width:220px;height:220px;background:var(--surface2);border:1px solid var(--border);border-radius:16px;display:flex;align-items:center;justify-content:center">
+            <div style="color:var(--muted);font-size:13px">اضغط لتوليد الـ QR</div>
+          </div>
+          <div id="qrLinkDisplay" style="font-size:12px;color:var(--muted);margin-bottom:16px;direction:ltr;word-break:break-all"></div>
+          <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+            <button class="btn btn-sm btn-dark" onclick="generateQRCode()">🔄 توليد QR</button>
+            <button class="btn btn-sm btn-green" onclick="downloadQR()">⬇️ تحميل الصورة</button>
+            <button class="btn btn-sm btn-green" onclick="printQR()">🖨️ طباعة</button>
+          </div>
+        </div>
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px;font-size:13px;color:var(--muted);line-height:1.8">
+          💡 امسح الـ QR بكاميرا الموبايل — بيفتح صفحة التسجيل مباشرة. اطبعه وحطه على باب قاعة الاجتماع.
+        </div>
+      </div>
+
+      <!-- رسالة الترحيب -->
+      <div class="admin-section" id="asec-welcome">
+        <div class="admin-section-title">📢 رسالة الترحيب</div>
+        <div class="form-group">
+          <label class="form-label">النص اللي بيظهر فوق صفحة التسجيل</label>
+          <input type="text" class="form-input" id="welcomeMsgInput" placeholder="مثال: أهلاً بكم في اجتماع المجلس التنفيذي — مايو 2026">
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-sm btn-dark" onclick="saveWelcomeMsg()">💾 حفظ الرسالة</button>
+          <button class="btn btn-sm btn-yellow" onclick="restartTour();switchTab('register')">❓ معاينة الشرح التوجيهي</button>
+        </div>
+      </div>
+
+      <!-- الحقول الإلزامية -->
+      <div class="admin-section" id="asec-fields">
+        <div class="admin-section-title">🔧 الحقول الإلزامية في التسجيل</div>
+        <div id="fieldToggles"></div>
+      </div>
+
+      <!-- إدارة الجهات -->
+      <div class="admin-section" id="asec-depts">
+        <div class="admin-section-title">🏢 إدارة الجهات وأرقام الهاتف</div>
+        <div id="adminDeptList"></div>
+        <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+          <input type="text" class="form-input" id="newDeptName" placeholder="اسم الجهة الجديدة..." style="flex:2;min-width:150px" onkeydown="if(event.key==='Enter')addDept()">
+          <input type="tel" class="form-input" id="newDeptPhone" placeholder="رقم الهاتف" style="flex:1;min-width:110px;direction:ltr">
+          <button class="btn btn-sm btn-dark" onclick="addDept()" style="white-space:nowrap">+ إضافة</button>
+        </div>
+        <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+          <div style="font-size:13px;font-weight:700;margin-bottom:8px;color:var(--muted)">📋 إضافة جهات بالجملة (كل جهة في سطر)</div>
+          <textarea class="form-input" id="bulkDeptInput" placeholder="مديرية التربية والتعليم&#10;مديرية الصحة&#10;..." style="min-height:110px;font-size:13px"></textarea>
+          <button class="btn btn-sm btn-dark" onclick="importDeptsFromText()" style="margin-top:8px">📥 استيراد الجهات</button>
+        </div>
+      </div>
+
+      <!-- الأكواد -->
+      <div class="admin-section" id="asec-codes">
+        <div class="admin-section-title">🔑 الأكواد السرية للجهات</div>
+        <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+          <button class="btn btn-sm btn-dark" onclick="generateAllCodes()">⚡ توليد أكواد عشوائية للكل</button>
+          <button class="btn btn-sm btn-yellow" onclick="exportCodesPDF()">📄 تصدير PDF</button>
+        </div>
+        <div id="codesTable"></div>
+      </div>
+
+      <!-- إدارة الاجتماع -->
+      <div class="admin-section" id="asec-meeting">
+        <div class="admin-section-title">📅 إدارة الاجتماع</div>
+
+        <div style="background:var(--error-light);border:1px solid rgba(204,34,0,.15);border-radius:14px;padding:18px;margin-bottom:14px">
+          <div style="font-size:14px;font-weight:800;color:var(--error);margin-bottom:6px">🔒 إنهاء الاجتماع الحالي</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.8">ينهي الاجتماع ويُحفظه في الأرشيف. الرابط الحالي يُقفل.</p>
+          <button class="btn btn-sm btn-red" onclick="closeMeeting()">🔒 إنهاء وأرشفة الاجتماع</button>
+        </div>
+
+        <div style="background:var(--warn-light);border:1px solid rgba(180,83,9,.15);border-radius:14px;padding:18px">
+          <div style="font-size:14px;font-weight:800;color:var(--warn);margin-bottom:6px">🆕 بدء اجتماع جديد</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.8">يبدأ اجتماع جديد برابط جديد. لو الحالي شغال بيُنهيه تلقائياً.</p>
+          <button class="btn btn-sm btn-yellow" onclick="newMeeting()">▶️ بدء اجتماع جديد</button>
+        </div>
+      </div>
+
+      <!-- واتساب الغائبين -->
+      <div class="admin-section" id="asec-whatsapp">
+        <div class="admin-section-title">💬 إرسال تذكير واتساب للغائبين</div>
+        <div class="form-group">
+          <label class="form-label">✍️ صِغ رسالتك — استخدم <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;color:var(--dark)">{جهة}</code> ليُستبدل باسم الجهة</label>
+          <textarea class="form-input" id="waMessageAdmin" placeholder="مثال: السلام عليكم، نذكركم بحضور اجتماع اليوم. الجهة: {جهة}. شكراً." style="min-height:90px"></textarea>
+        </div>
+        <button class="btn btn-sm btn-whatsapp" onclick="sendWaAllAdmin()" style="width:100%;justify-content:center;padding:13px;font-size:15px;margin-bottom:14px">📲 توليد روابط واتساب للغائبين</button>
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:11px;padding:13px;margin-bottom:16px;font-size:13px;color:var(--muted);line-height:1.8">
+          💡 اكتب الرسالة واضغط الزرار — هيظهرلك رابط لكل جهة غائبة
+        </div>
+        <div id="waAllLinksContainer"></div>
+        <div id="waAdminAbsentList" style="margin-top:14px"></div>
+      </div>
+
+      <!-- Firebase -->
+      <div class="admin-section" id="asec-firebase">
+        <div class="admin-section-title">🔥 حالة Firebase</div>
+        <div id="fbStatus" style="font-size:14px;font-weight:700;margin-bottom:16px">جاري التحقق...</div>
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px;font-size:13px;color:var(--muted);line-height:1.8">
+          Firebase هو قاعدة البيانات اللي بتحفظ كل التسجيلات وبتزامنها بين كل الأجهزة في نفس اللحظة.
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+</div>
+
+<script>
+var isAdminMode=false;
+setInterval(()=>{
+  const el=document.getElementById('fbStatus');
+  if(el){ el.textContent=window.fbConnected?'✅ متصل — البيانات تُحفظ مباشرة':'⚠️ غير متصل حالياً'; el.style.color=window.fbConnected?'var(--success)':'var(--warn)'; }
+},2000);
+
+// ════════════════════════════════════
+//  WHATSAPP ADMIN PANEL
+// ════════════════════════════════════
+function renderWaAdminPanel(){
+  const presentD=new Set(Object.values(attendance).map(r=>r.dept));
+  const absent=DEPARTMENTS.filter(d=>!presentD.has(d.name));
+  const container=document.getElementById('waAdminAbsentList');
+  if(!container) return;
+  if(!absent.length){
+    container.innerHTML='<div class="empty-state" style="padding:30px"><div class="empty-icon">🎉</div><div class="empty-text">كل الجهات حضرت!</div></div>';
+    return;
+  }
+  container.innerHTML=absent.map((d,i)=>`
+    <div class="wa-item">
+      <div class="wa-dept-name">❌ ${esc(d.name)}</div>
+      <input type="tel" class="wa-phone" id="waAdminP_${i}" value="${esc(d.phone||'')}" placeholder="01xxxxxxxxx" dir="ltr"
+        onchange="saveWaPhone_(${esc(JSON.stringify(d.name))},this.value)">
+      <button class="btn btn-sm btn-whatsapp" onclick="sendWaAdminSingle(${i},${esc(JSON.stringify(d.name))})">📲</button>
+    </div>`).join('');
+}
+window.sendWaAdminSingle=function(i,deptName){
+  const msg=document.getElementById('waMessageAdmin')?.value.trim();
+  if(!msg) return toast('من فضلك اكتب الرسالة أولاً','warn');
+  const inp=document.getElementById('waAdminP_'+i);
+  if(!inp) return;
+  let phone=inp.value.trim().replace(/\D/g,'');
+  if(!phone) return toast('من فضلك أضف رقم الهاتف','warn');
+  if(phone.startsWith('00')) phone=phone.slice(2);
+  else if(phone.startsWith('0')) phone='2'+phone.slice(1);
+  const text=msg.replace(/\{جهة\}/g,deptName);
+  window.open('https://wa.me/'+phone+'?text='+encodeURIComponent(text),'_blank');
+};
+window.sendWaAllAdmin=function(){
+  const msg=document.getElementById('waMessageAdmin')?.value.trim();
+  if(!msg) return toast('من فضلك اكتب الرسالة أولاً','warn');
+  const presentD=new Set(Object.values(attendance).map(r=>r.dept));
+  const absent=DEPARTMENTS.filter(d=>!presentD.has(d.name));
+  const withPhone=absent.filter(d=>d.phone&&d.phone.trim());
+  if(!withPhone.length) return toast('لا يوجد أرقام — أضفها من إدارة الجهات','warn');
+  const links=withPhone.map(d=>{
+    const text=msg.replace(/\{جهة\}/g,d.name);
+    let phone=d.phone.replace(/\D/g,'');
+    if(phone.startsWith('00')) phone=phone.slice(2);
+    else if(phone.startsWith('0')) phone='2'+phone.slice(1);
+    return {name:d.name, url:'https://wa.me/'+phone+'?text='+encodeURIComponent(text)};
+  });
+  const container=document.getElementById('waAllLinksContainer');
+  if(!container){toast('❌ خطأ','error');return;}
+  container.innerHTML=`
+    <div style="background:var(--warn-light);border:1px solid rgba(180,83,9,.2);border-radius:12px;padding:14px;margin-top:14px">
+      <div style="font-size:13px;font-weight:800;color:var(--warn);margin-bottom:10px">📲 اضغط على كل جهة لفتح واتساب (${links.length} جهة)</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${links.map((l,i)=>`
+          <a href="${l.url}" target="_blank" rel="noopener noreferrer"
+            style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:#25D366;color:#fff;border-radius:10px;text-decoration:none;font-family:'Cairo',sans-serif;font-size:13px;font-weight:700">
+            <span>💬</span><span style="flex:1">${i+1}. ${esc(l.name)}</span><span style="font-size:11px;opacity:.8">← افتح</span>
+          </a>`).join('')}
+      </div>
+    </div>`;
+  toast('✅ روابط الواتساب جاهزة','success',6000);
+};
+
+// ════════════════════════════════════
+//  TOOLS MENU TOGGLE
+// ════════════════════════════════════
+window.toggleToolsMenu=function(){
+  const menu=document.getElementById('toolsMenu');
+  const btn=document.getElementById('toolsMenuBtn');
+  if(!menu) return;
+  const open=menu.style.display==='none'||menu.style.display==='';
+  menu.style.display=open?'block':'none';
+  if(btn) btn.textContent=open?'🛠️ أدوات ▴':'🛠️ أدوات ▾';
+};
+
+// ════════════════════════════════════
+//  SORT & FILTER
+// ════════════════════════════════════
+window.setSortMode=function(mode){
+  window.sortMode=mode;
+  document.querySelectorAll('.sort-btn').forEach(b=>{
+    b.style.background='var(--surface)'; b.style.color='var(--text)'; b.style.borderColor='var(--border)';
+  });
+  const btn=document.getElementById('sort-'+mode);
+  if(btn){ btn.style.background='var(--dark)'; btn.style.color='#fff'; btn.style.borderColor='var(--dark)'; }
+  if(window.renderTable) window.renderTable();
+};
+window.setFilterMode=function(mode){
+  window.filterMode=mode;
+  document.querySelectorAll('.filter-btn').forEach(b=>{
+    b.style.background='var(--surface)'; b.style.color='var(--text)'; b.style.borderColor='var(--border)';
+  });
+  const btn=document.getElementById('filter-'+mode);
+  if(btn){ btn.style.background='var(--dark)'; btn.style.color='#fff'; btn.style.borderColor='var(--dark)'; }
+  if(window.renderTable) window.renderTable();
+};
+
+// ════════════════════════════════════
+//  DARK MODE
+// ════════════════════════════════════
+window.toggleDarkMode=function(){
+  const isDark=document.body.classList.toggle('dark-mode');
+  localStorage.setItem('darkMode',isDark?'1':'0');
+  document.getElementById('darkModeBtn').textContent=isDark?'☀️':'🌙';
+};
+
+
+// ════════════════════════════════════
+//  PROGRESS BAR DYNAMIC
+// ════════════════════════════════════
+window.buildProgressSteps=function(){
+  const prog=document.getElementById('regProgress');
+  if(!prog || !window.FIELDS_REF) return;
+  const F=window.FIELDS_REF;
+  const steps=[];
+  steps.push({id:'psDept',label:'الجهة',icon:'1'});
+  if(F.name!==false) steps.push({id:'psName',label:'الاسم',icon:steps.length+1});
+  if(F.role!==false) steps.push({id:'psRole',label:'الصفة',icon:steps.length+1});
+  if(F.code===true) steps.push({id:'psCode',label:'الكود',icon:steps.length+1});
+  steps.push({id:'psReg',label:'تسجيل',icon:'✓'});
+  prog.innerHTML=steps.map(s=>`
+    <div class="reg-step" id="${s.id}">
+      <div class="reg-dot">${s.icon}</div>
+      <div class="reg-step-label">${s.label}</div>
+    </div>`).join('');
+  document.getElementById('psDept')?.classList.add('active');
+};
+
+window.updateProgress=function(){
+  if(!window.FIELDS_REF) return;
+  const F=window.FIELDS_REF;
+  const dept=document.getElementById('deptVal')?.value.trim();
+  const name=document.getElementById('nameInput')?.value.trim();
+  const code=document.getElementById('deptCode')?.value.trim();
+  const role=window.ROLE_REF||'';
+
+  const stepIds=['psDept'];
+  if(F.name!==false) stepIds.push('psName');
+  if(F.role!==false) stepIds.push('psRole');
+  if(F.code===true) stepIds.push('psCode');
+  stepIds.push('psReg');
+
+  let done=0;
+  if(dept){ done++; }
+  if(F.name!==false){ if(name && name.length>=2) done++; }
+  if(F.role!==false){ if(role) done++; }
+  if(F.code===true){ if(code) done++; }
+
+  stepIds.forEach((sid,i)=>{
+    const el=document.getElementById(sid);
+    if(!el) return;
+    el.classList.remove('done','active');
+    if(i<done) el.classList.add('done');
+    else if(i===done) el.classList.add('active');
+  });
+
+  const ds=document.getElementById('deptSearch');
+  if(ds){ if(dept) ds.classList.add('confirmed'); else ds.classList.remove('confirmed'); }
+  const ni=document.getElementById('nameInput');
+  if(ni){ if(name&&name.length>=2) ni.classList.add('confirmed'); else ni.classList.remove('confirmed'); }
+  const ci=document.getElementById('deptCode');
+  if(ci){ if(code) ci.classList.add('confirmed'); else ci.classList.remove('confirmed'); }
+};
+
+window.regBtnClick=function(e){
+  const btn=document.getElementById('regBtn');
+  if(btn){
+    const circle=document.createElement('div');
+    const rect=btn.getBoundingClientRect();
+    const size=Math.max(rect.width,rect.height)*2;
+    circle.style.cssText='position:absolute;width:'+size+'px;height:'+size+'px;border-radius:50%;background:rgba(255,255,255,.25);top:'+(e.clientY-rect.top-size/2)+'px;left:'+(e.clientX-rect.left-size/2)+'px;animation:ripple .6s ease-out forwards;pointer-events:none;z-index:1';
+    btn.appendChild(circle);
+    setTimeout(()=>circle.remove(),600);
+  }
+  if(window.registerAttendance) window.registerAttendance();
+};
+
+</script>
+</body>
+</html>
